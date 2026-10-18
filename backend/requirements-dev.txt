@@ -1,0 +1,5 @@
+# Development and test dependencies for Axiom backend (v0.1 skeleton)
+-r requirements.txt
+
+pytest==9.1.1
+httpx==0.28.1

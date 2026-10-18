@@ -1,0 +1,81 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Axiom v0.1 eval question row",
+  "description": "One eval row. A retrieved chunk counts as a hit for a gold span if, after collapsing all whitespace runs to single spaces on both sides, the chunk text contains the span. Category 'multi-chunk' means the evidence spans at least two retrieval chunks (same or different documents); it does not imply multi-hop reasoning. Category 'citation' means the answer must quote the passage exactly.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["id", "question", "category", "answerable", "expected", "visible_docs", "requester", "gold", "key_facts"],
+  "properties": {
+    "id": { "type": "string", "pattern": "^q[0-9]{2}$" },
+    "question": { "type": "string", "minLength": 1 },
+    "category": {
+      "type": "string",
+      "enum": ["fact", "multi-chunk", "cross-doc", "unanswerable", "isolation", "citation"]
+    },
+    "answerable": {
+      "type": "boolean",
+      "description": "True if visible_docs contain sufficient evidence to answer."
+    },
+    "expected": {
+      "type": "string",
+      "enum": ["answer", "abstain"],
+      "description": "answer = grounded cited answer; abstain = explicit 'not enough evidence' plus missing_evidence."
+    },
+    "visible_docs": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "type": "string", "minLength": 1 },
+      "description": "Corpus files present in the requester's workspace. Retrieval must not use anything else."
+    },
+    "forbidden_docs": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 },
+      "description": "Optional, isolation rows: documents that must appear in neither the retrieved set nor the citations. Failing the row if they do, even when the final answer abstains."
+    },
+    "requester": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["workspace", "role"],
+      "properties": {
+        "workspace": { "type": "string", "minLength": 1 },
+        "role": { "type": "string", "enum": ["owner", "admin", "member", "viewer"] }
+      }
+    },
+    "gold": {
+      "type": "array",
+      "description": "Verbatim spans from pypdf extraction of the locked PDF's specified page (line breaks encoded as \\n). Empty if and only if expected=abstain.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["doc", "page", "span"],
+        "properties": {
+          "doc": { "type": "string", "minLength": 1 },
+          "page": { "type": "integer", "minimum": 1 },
+          "span": { "type": "string", "minLength": 1 }
+        }
+      }
+    },
+    "key_facts": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 },
+      "description": "Atomic facts a correct answer must contain; each must be entailed by the gold evidence."
+    },
+    "missing_evidence": {
+      "type": "string",
+      "description": "Required when expected=abstain: what input would be needed. Forbidden otherwise."
+    }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "expected": { "const": "abstain" } } },
+      "then": {
+        "properties": { "answerable": { "const": false }, "gold": { "maxItems": 0 } },
+        "required": ["missing_evidence"]
+      },
+      "else": {
+        "properties": { "answerable": { "const": true }, "gold": { "minItems": 1 } },
+        "not": { "required": ["missing_evidence"] }
+      }
+    }
+  ]
+}

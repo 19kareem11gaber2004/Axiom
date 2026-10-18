@@ -1,0 +1,48 @@
+{
+  "version": "v0.1",
+  "frozen_at": "2026-10-17",
+  "spans_verified_with": "pypdf 6.21.0 extraction; gold spans match whitespace-normalized substrings of the specified page's text",
+  "method": "Downloaded with browser user-agent; sha256, byte size, and pypdf page counts verified 2026-10-17. PDFs are NOT vendored: the Phase 5 harness downloads each source_url and aborts unless bytes and sha256 match exactly.",
+  "docs": [
+    {
+      "file": "attention.pdf",
+      "source_url": "https://arxiv.org/pdf/1706.03762v5",
+      "description": "Vaswani et al., Attention Is All You Need (NIPS 2017 version)",
+      "bytes": 2201700,
+      "sha256": "bfaaec89262875f927cf1b38b2da2d775f3309b7bea3537f29b606ca67e79065",
+      "pages": 15,
+      "license": "arXiv.org perpetual, non-exclusive license 1.0 (default; the version record carries no explicit license element)",
+      "license_evidence": "arXiv API record for 1706.03762v5 fetched 2026-10-17 contains no license/rights element; default terms at https://info.arxiv.org/help/license/ state the license 'gives limited rights to arXiv to distribute the article, and also limits re-use of any type from other entities or individuals'. Corpus use is limited to source-download at harness time (no redistribution) plus short attributed quotation for evaluation."
+    },
+    {
+      "file": "bert.pdf",
+      "source_url": "https://arxiv.org/pdf/1810.04805v2",
+      "description": "Devlin et al., BERT (NAACL 2019 version)",
+      "bytes": 775166,
+      "sha256": "5692a5514787a8c6727b4ff3b726a3385798bc68e12138d1d4af83947e2acf6e",
+      "pages": 16,
+      "license": "arXiv.org perpetual, non-exclusive license 1.0 (default; the version record carries no explicit license element)",
+      "license_evidence": "arXiv API record for 1810.04805v2 fetched 2026-10-17 contains no license/rights element; default terms at https://info.arxiv.org/help/license/. Same no-redistribution, short-quotation-only use as attention.pdf."
+    },
+    {
+      "file": "udhr_en.pdf",
+      "source_url": "https://www.ohchr.org/sites/default/files/UDHR/Documents/UDHR_Translations/eng.pdf",
+      "description": "Universal Declaration of Human Rights (English, OHCHR)",
+      "bytes": 195195,
+      "sha256": "e75f479c5cc632e88dcf3da247bbef96b093462610c0eee53d281f1fe379661c",
+      "pages": 8,
+      "license": "Copyright United Nations; excerpts from non-sales publications reproducible without permission provided proper credit is given",
+      "license_evidence": "https://shop.un.org/rights-permissions ('Excerpts from a non-sales publication: No permission is necessary to reproduce excerpts from a non-sales publication provided that proper credits are given'); https://www.un.org/en/about-us/copyright (Copyright (c) United Nations, all rights reserved). Corpus reproduces short attributed excerpts only and never redistributes the PDF."
+    },
+    {
+      "file": "nist-ai-rmf.pdf",
+      "source_url": "https://nvlpubs.nist.gov/nistpubs/ai/NIST.AI.100-1.pdf",
+      "description": "NIST Artificial Intelligence Risk Management Framework (AI RMF 1.0, Jan 2023); also at https://doi.org/10.6028/NIST.AI.100-1",
+      "bytes": 1946127,
+      "sha256": "7576edb531d9848825814ee88e28b1795d3a84b435b4b797d3670eafdc4a89f1",
+      "pages": 48,
+      "license": "Public domain: work of the United States Government",
+      "license_evidence": "Published by NIST (U.S. Department of Commerce) at nvlpubs.nist.gov; 17 U.S.C. section 105 provides that copyright protection 'is not available for any work of the United States Government' (verified against statute text 2026-10-17)."
+    }
+  ]
+}
