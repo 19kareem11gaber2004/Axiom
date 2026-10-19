@@ -12,20 +12,6 @@ import pytest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
-def psycopg_dsn(database_url: str) -> str:
-    """Convert a SQLAlchemy URL into a libpq/psycopg connection string.
-
-    settings.database_url is a SQLAlchemy URL such as
-    "postgresql+psycopg://user:pass@host:5432/db". psycopg.connect() only
-    understands the plain "postgresql://" scheme, so passing the URL
-    straight through raises ProgrammingError.
-    """
-    from sqlalchemy.engine import make_url
-
-    url = make_url(database_url)
-    return url.set(drivername="postgresql").render_as_string(hide_password=False)
-
-
 @pytest.fixture
 def db_session():
     """Yield a SQLAlchemy session bound to a real PostgreSQL database.
@@ -42,13 +28,10 @@ def db_session():
     """
     import psycopg
 
-    from app.config import settings
-    from app.db.session import SessionLocal, engine
+    from app.db.session import SessionLocal, engine, psycopg_dsn
 
     try:
-        probe = psycopg.connect(
-            psycopg_dsn(settings.database_url), connect_timeout=3
-        )
+        probe = psycopg.connect(psycopg_dsn(), connect_timeout=3)
         probe.close()
     except Exception as exc:
         pytest.skip(f"PostgreSQL not available: {exc}")

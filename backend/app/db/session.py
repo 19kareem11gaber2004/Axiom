@@ -8,6 +8,7 @@ session through get_db() (or SessionLocal directly in the worker).
 from typing import Generator
 
 from sqlalchemy import create_engine
+from sqlalchemy.engine import make_url
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.config import settings
@@ -32,6 +33,21 @@ SessionLocal = sessionmaker(
     # session otherwise.
     expire_on_commit=False,
 )
+
+
+def psycopg_dsn(database_url: str | None = None) -> str:
+    """Convert a SQLAlchemy URL into a libpq/psycopg connection string.
+
+    settings.database_url is a SQLAlchemy URL such as
+    "postgresql+psycopg://user:pass@host:5432/db". The "+psycopg" part is
+    a SQLAlchemy dialect selector and is meaningless to psycopg, which
+    only understands the plain "postgresql://" scheme. Passing the URL
+    straight through raises ProgrammingError, which is how a readiness
+    check can report "database down" while the application is talking to
+    that very database successfully.
+    """
+    url = make_url(database_url if database_url is not None else settings.database_url)
+    return url.set(drivername="postgresql").render_as_string(hide_password=False)
 
 
 def get_db() -> Generator[Session, None, None]:

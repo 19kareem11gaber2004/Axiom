@@ -14,7 +14,7 @@ import pytest
 import redis
 
 from app.config import settings
-from conftest import psycopg_dsn
+from app.db.session import psycopg_dsn
 
 PG_TIMEOUT = 3
 REDIS_TIMEOUT = 3
@@ -24,9 +24,7 @@ REDIS_TIMEOUT = 3
 def pg_conn():
     """Yield a psycopg connection to PostgreSQL, skipping if unavailable."""
     try:
-        conn = psycopg.connect(
-            psycopg_dsn(settings.database_url), connect_timeout=PG_TIMEOUT
-        )
+        conn = psycopg.connect(psycopg_dsn(), connect_timeout=PG_TIMEOUT)
     except Exception as exc:
         pytest.skip(f"PostgreSQL not available: {exc}")
     yield conn

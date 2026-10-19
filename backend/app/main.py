@@ -94,7 +94,9 @@ def check_postgres() -> bool:
     try:
         from psycopg import connect
 
-        conn = connect(settings.database_url, connect_timeout=3)
+        from app.db.session import psycopg_dsn
+
+        conn = connect(psycopg_dsn(), connect_timeout=3)
         with conn.cursor() as cur:
             cur.execute("SELECT 1")
         conn.close()

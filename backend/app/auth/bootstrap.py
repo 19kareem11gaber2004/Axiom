@@ -24,9 +24,11 @@ import sys
 
 from pydantic import EmailStr, TypeAdapter, ValidationError
 from sqlalchemy import func, select
-from sqlalchemy.exc import ProgrammingError
+from sqlalchemy.engine import make_url
+from sqlalchemy.exc import OperationalError, ProgrammingError
 
 from app.auth.service import create_workspace, hash_password
+from app.config import settings
 from app.db.models import User
 from app.db.session import SessionLocal
 
@@ -35,11 +37,76 @@ from app.db.session import SessionLocal
 _EMAIL_ADAPTER = TypeAdapter(EmailStr)
 
 
+class PasswordUnavailableError(Exception):
+    """The password cannot be read without echoing it."""
+
+
+class BootstrapConnectionError(Exception):
+    """The database could not be reached."""
+
+
+def _can_prompt_securely() -> bool:
+    """True when a password can be read without being echoed.
+
+    getpass falls back to reading stdin with the password ECHOED when
+    there is no controlling terminal. That happens inside a container
+    unless a TTY was allocated, so the prompt is refused there rather
+    than leaking the secret into the terminal or the log.
+    """
+    if sys.stdin.isatty():
+        return True
+    try:
+        handle = os.open("/dev/tty", os.O_RDWR)
+    except OSError:
+        return False
+    os.close(handle)
+    return True
+
+
 def _read_password() -> str:
     password = os.environ.get("BOOTSTRAP_PASSWORD")
     if password:
         return password
+    if not _can_prompt_securely():
+        raise PasswordUnavailableError(
+            "No terminal is available to read the password without echoing "
+            "it.\n"
+            "Set BOOTSTRAP_PASSWORD in the environment instead, for example:\n"
+            "  $env:BOOTSTRAP_PASSWORD = Read-Host 'Admin password' -AsSecureString"
+        )
     return getpass.getpass("Password for the bootstrap administrator: ")
+
+
+def _database_target() -> str:
+    """Human readable database target, without the password."""
+    try:
+        url = make_url(settings.database_url)
+    except Exception:  # noqa: BLE001 - display only
+        return "<unparseable DATABASE_URL>"
+    return "%s:%s/%s" % (url.host, url.port or 5432, url.database)
+
+
+def _connection_help(exc: Exception) -> str:
+    """Explain a failed connection, including which server was tried.
+
+    The raw driver message usually blames the password, which is a
+    red herring when the real problem is that the command is talking to
+    a different PostgreSQL than the one the API uses.
+    """
+    reason = str(exc).strip().splitlines()[0] if str(exc).strip() else exc.__class__.__name__
+    return (
+        "Could not connect to the database.\n"
+        "  target : %s\n"
+        "  reason : %s\n"
+        "\n"
+        "The API and the worker use the Compose service name, not "
+        "'localhost'.\n"
+        "If the database runs in Docker Compose, run this command inside "
+        "the Compose network:\n"
+        "  docker compose run --rm api python -m app.auth.bootstrap "
+        "--email <email> --workspace <name>"
+        % (_database_target(), reason)
+    )
 
 
 def _validate_email(email: str) -> str:
@@ -82,7 +149,12 @@ def _parse_args(argv=None) -> argparse.Namespace:
 def main(argv=None) -> int:
     args = _parse_args(argv)
 
-    password = args.password or _read_password()
+    try:
+        password = args.password or _read_password()
+    except PasswordUnavailableError as exc:
+        print(exc)
+        return 2
+
     if len(password.encode("utf-8")) > 72:
         print("Password is too long (bcrypt accepts at most 72 bytes).")
         return 2
@@ -107,9 +179,11 @@ def main(argv=None) -> int:
         except ProgrammingError:
             # PostgreSQL reports a missing table as a ProgrammingError
             # (SQLSTATE 42P01).
-            print(
-                "The database is not migrated. Run 'alembic upgrade head' first."
-            )
+            print("The database is not migrated. Apply the migration first:")
+            print("  docker compose run --rm api alembic upgrade head")
+            return 1
+        except OperationalError as exc:
+            print(_connection_help(exc))
             return 1
 
         if existing:
@@ -128,6 +202,10 @@ def main(argv=None) -> int:
         print("Created workspace %r (id=%s)" % (workspace.name, workspace.id))
         print("Sign in with POST /api/v1/auth/login")
         return 0
+    except OperationalError as exc:
+        session.rollback()
+        print(_connection_help(exc))
+        return 1
     except Exception as exc:  # noqa: BLE001 - CLI boundary
         session.rollback()
         print("Bootstrap failed: %s" % exc)
