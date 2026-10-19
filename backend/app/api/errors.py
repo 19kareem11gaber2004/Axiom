@@ -21,6 +21,7 @@ from typing import Optional
 from fastapi import FastAPI, Request, status
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
+from starlette.middleware.base import BaseHTTPMiddleware
 
 logger = logging.getLogger("axiom.api")
 
@@ -161,6 +162,39 @@ def _request_id(request: Request) -> Optional[str]:
     return getattr(request.state, "request_id", None)
 
 
+class ErrorBoundaryMiddleware(BaseHTTPMiddleware):
+    """Turns unhandled exceptions into the Axiom error envelope.
+
+    This middleware must be registered *inside* CORSMiddleware. Starlette
+    attaches a plain ``@app.exception_handler(Exception)`` handler to
+    ServerErrorMiddleware, which sits outside the whole user middleware
+    stack. A 500 produced there would carry no CORS headers, so a browser
+    would report a CORS error instead of a server error - a genuinely
+    confusing debugging trap.
+
+    Catching the exception here keeps the 500 response inside the CORS
+    layer, where the CORS headers are added normally.
+    """
+
+    async def dispatch(self, request, call_next):
+        try:
+            return await call_next(request)
+        except Exception:  # noqa: BLE001 - this is the boundary
+            logger.exception(
+                "Unhandled error",
+                extra={"request_id": _request_id(request), "path": request.url.path},
+            )
+            return JSONResponse(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                content=_error_body(
+                    code="INTERNAL_ERROR",
+                    message="An unexpected error occurred.",
+                    retryable=False,
+                    request_id=_request_id(request),
+                ),
+            )
+
+
 def register_error_handlers(app: FastAPI) -> None:
     """Attach Axiom's error handlers to the FastAPI application.
 
@@ -207,23 +241,8 @@ def register_error_handlers(app: FastAPI) -> None:
             ),
         )
 
-    @app.exception_handler(Exception)
-    async def handle_unexpected(request: Request, exc: Exception) -> JSONResponse:
-        """Catch-all: never leak internal details to the client.
-
-        The full exception is logged server-side; the client receives a
-        generic message plus the request ID for correlation.
-        """
-        logger.exception(
-            "Unhandled error",
-            extra={"request_id": _request_id(request), "path": request.url.path},
-        )
-        return JSONResponse(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            content=_error_body(
-                code="INTERNAL_ERROR",
-                message="An unexpected error occurred.",
-                retryable=False,
-                request_id=_request_id(request),
-            ),
-        )
+    # Unhandled exceptions are handled by ErrorBoundaryMiddleware, which
+    # is registered inside CORSMiddleware so that a 500 response still
+    # carries CORS headers. Registering a handler for Exception here
+    # instead would attach it to ServerErrorMiddleware, outside the CORS
+    # layer, and the browser would see a CORS error rather than a 500.

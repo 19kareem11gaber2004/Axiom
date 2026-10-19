@@ -1,9 +1,11 @@
 """Authentication routes: login, current principal, logout."""
 
-from fastapi import APIRouter, Depends, Response, status
+from typing import Optional
+
+from fastapi import APIRouter, Depends, Request, Response, status
 from sqlalchemy.orm import Session
 
-from app.api.errors import AuthenticationError
+from app.api.errors import AuthenticationError, RateLimitError
 from app.api.schemas import (
     CurrentUserRead,
     MembershipRead,
@@ -15,23 +17,55 @@ from app.auth.dependencies import (
     get_current_membership,
     list_memberships,
 )
+from app.auth.rate_limit import (
+    check_login_allowed,
+    record_login_failure,
+    reset_login_failures,
+)
 from app.auth.service import authenticate_user, create_access_token
 from app.db.session import get_db
 
 router = APIRouter(prefix="/api/v1/auth", tags=["auth"])
 
 
+def _client_ip(request: Request) -> Optional[str]:
+    """The caller's source address.
+
+    Behind a reverse proxy this is the proxy's address; honouring
+    X-Forwarded-For is a deployment concern and is deliberately not
+    trusted here, because a client could otherwise spoof the header to
+    escape the per-IP limit.
+    """
+    client = request.client
+    return client.host if client else None
+
+
 @router.post("/login", response_model=TokenResponse)
-def login(payload: TokenRequest, db: Session = Depends(get_db)):
+def login(payload: TokenRequest, request: Request, db: Session = Depends(get_db)):
     """Exchange credentials for a JWT access token.
 
     The failure message is deliberately identical for an unknown email and
     for a wrong password, so the endpoint cannot be used to discover which
     email addresses are registered.
+
+    Repeated failures are rate limited per account and per source IP; the
+    limit is cleared by a successful login.
     """
+    ip_address = _client_ip(request)
+
+    allowed, retry_after = check_login_allowed(payload.email, ip_address)
+    if not allowed:
+        raise RateLimitError(
+            "Too many failed login attempts. Try again in %d seconds."
+            % retry_after
+        )
+
     user = authenticate_user(db, payload.email, payload.password)
     if user is None:
+        record_login_failure(payload.email, ip_address)
         raise AuthenticationError("Invalid email or password.")
+
+    reset_login_failures(payload.email, ip_address)
 
     memberships = list_memberships(db, user.id)
     return TokenResponse(

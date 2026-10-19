@@ -36,6 +36,27 @@ class Settings(BaseSettings):
     # Maximum accepted upload size in bytes (25 MiB).
     max_upload_bytes: int = 25 * 1024 * 1024
 
+    # --- CORS (Phase 2, step 2.6) ---
+    # Explicit browser origins allowed to call the API. Comma separated in
+    # the CORS_ORIGINS environment variable. The default is the Vite dev
+    # server used by the React frontend.
+    cors_origins: str = "http://localhost:5173"
+    # Axiom authenticates with a Bearer token, not a cookie, so the
+    # browser never needs to attach credentials automatically. Leaving
+    # this off means a wildcard origin can never be combined with
+    # credentials.
+    cors_allow_credentials: bool = False
+
+    # --- Login rate limiting (Phase 2, step 2.7) ---
+    # Failed logins allowed per identifier inside the window.
+    login_rate_limit_max_attempts: int = 5
+    # Length of the rate limiting window in seconds.
+    login_rate_limit_window_seconds: int = 60
+    # Failed logins allowed per source IP inside the window. Higher than
+    # the per-account limit because many users can share one address
+    # (office NAT, VPN).
+    login_rate_limit_max_attempts_per_ip: int = 30
+
     model_config = {"env_file": ".env", "env_file_encoding": "utf-8"}
 
     @model_validator(mode="after")
@@ -52,6 +73,27 @@ class Settings(BaseSettings):
                 "ENV is not 'dev'."
             )
         return self
+
+    @property
+    def cors_origin_list(self) -> list[str]:
+        """The configured CORS origins as a list.
+
+        A wildcard is rejected here rather than passed to the middleware:
+        Starlette echoes the request Origin back when a wildcard is
+        combined with credentials, which lets any site make credentialed
+        cross-origin requests.
+        """
+        origins = [
+            origin.strip()
+            for origin in self.cors_origins.split(",")
+            if origin.strip()
+        ]
+        if "*" in origins and self.cors_allow_credentials:
+            raise ValueError(
+                "CORS_ORIGINS must not contain '*' while credentials are "
+                "allowed. List the explicit origins instead."
+            )
+        return origins
 
 
 settings = Settings()

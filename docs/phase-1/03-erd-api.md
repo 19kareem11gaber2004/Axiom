@@ -45,7 +45,9 @@ All user-data tables carry `workspace_id` from creation. Server resolves it from
 
 **citations** — `id, message_id NOT NULL, workspace_id NOT NULL, document_id NOT NULL (snapshot, NO FK — see §3), chunk_id NULL FK→chunks(id) ON DELETE SET NULL, original_filename TEXT NOT NULL (snapshot), page_number NULL, passage_text TEXT NOT NULL (snapshot), score NULL, created_at`; FK `(message_id, workspace_id) → messages(id, workspace_id) ON DELETE CASCADE` `[v0.1]`; `INDEX(message_id)` `[v0.1]`.
 
-Reference implementation: `backend/app/db/models.py:1`. NOTE: models.py predates this review and does not yet contain `original_filename` on citations, the `processing_runs` unique constraint, the new CHECKs/indexes, or the corrected `ON DELETE` actions. Align it in Phase 2 migrations; the document above is authoritative.
+Reference implementation: `backend/app/db/models.py:1` — **aligned with this section** (Step 9.4): it contains `original_filename` on citations, the `processing_runs` unique constraint, the chunk CHECKs/indexes, and the `ON DELETE` actions above. Migration `backend/alembic/versions/0001_v01_init.py` matches it and has been executed against a real PostgreSQL 18.6 + pgvector 0.8.1 instance.
+
+ENUM note: `document_status`, `membership_role` and `message_role` are native PostgreSQL ENUM types. Revision 0001 creates each one **exactly once** (see `create_type=False` in the migration) — SQLAlchemy's default automatic `CREATE TYPE` emission would otherwise produce a duplicate that PostgreSQL rejects. `backend/tests/test_migration_sql.py` guards this.
 
 ## 3. Deletion policy [v0.1]
 
@@ -131,15 +133,54 @@ Add only what v0.1 access patterns justify (no ANN index):
 
 Base `/api/v1`, Bearer JWT, envelope `{error:{code,message,retryable,request_id}}`. `workspace_id` always from membership. New endpoint `GET /documents/{id}/file` is added because without it there is no authorized file-access path (frontend must never touch storage directly).
 
+### 8.1 Authentication and workspaces (Phase 2, implemented)
+
+The access token carries **only** the user id (`sub`), an issued-at and an expiry. Workspace and role are **never** read from the token: they are resolved from `workspace_memberships` on every request, so a revoked membership or a demotion takes effect on the next request instead of at token expiry. A client may send `X-Workspace-ID` to *select* one of several workspaces it belongs to; the value is verified against the database and grants nothing on its own.
+
 | Method | Endpoint | Role | Success | Errors | Scoping / state |
 |---|---|---|---|---|---|
-| `POST` | `/documents` (multipart PDF) | member+ | `202 {document_id, status:'queued'}` | `400 VALIDATION_ERROR` (type/size), `403 NOT_MEMBER`, `429 RATE_LIMITED` | workspace from token; row committed as `uploaded` then enqueued (§6.5) |
-| `GET` | `/documents?status=&q=&limit=&offset=` | viewer+ | `200 {items, total}` ordered `(created_at,id)` | `403 NOT_MEMBER` | workspace-filtered; `q` matches filename only in v0.1 |
-| `GET` | `/documents/{id}` | viewer+ | `200` metadata+status+error | `404 NOT_FOUND` (incl. other-workspace ids) | membership-checked |
-| `GET` | `/documents/{id}/file` | viewer+ | `200` file stream | `404 NOT_FOUND`, `409 NOT_READY` (not indexed) | membership-checked; no storage paths leak |
-| `POST` | `/documents/{id}/retry` | member+ | `202 {document_id, status:'queued'}` | `404`, `409 INVALID_STATE` (not `failed` / non-retryable / already `queued`), `403` | clears error, `attempts+1`, new run row |
-| `DELETE` | `/documents/{id}` | admin+ | `204` | `404`, `409 CONFLICT` (in `processing/retrying`), `403` | txn per §3; file + cascades removed |
-| `POST` | `/chat` `{conversation_id?, question, top_k?}` | viewer+ | `200 {message_id, answer, citations[{document_id,original_filename,page_number,passage_text,score}]}` or abstention `{answer, missing_evidence[]}` | `400/404` (bad/foreign conversation), `403`, `429` | retrieval filtered to workspace + `indexed` docs only; citations validated |
+| `POST` | `/auth/login` `{email, password}` | none | `200 {access_token, token_type, workspaces[{workspace_id, role}]}` | `401 UNAUTHENTICATED` (generic: unknown email and wrong password are indistinguishable), `429 RATE_LIMITED` (too many failures), `422` | failures are counted per account **and** per source IP; a successful login clears both counters |
+| `GET` | `/auth/me` | any member | `200 {id, email, workspace_id, role}` | `401`, `403` (no membership / several workspaces without `X-Workspace-ID`) | identity from token, workspace+role from DB |
+| `POST` | `/auth/logout` | none | `204` | — | stateless JWT: the client discards the token; server-side revocation is `[later]` |
+| `POST` | `/workspaces` `{name}` | authenticated | `201 {id, name, created_at}` | `401`, `422` | creator becomes `owner`; workspace + membership written in one transaction |
+| `GET` | `/workspaces` | authenticated | `200 [WorkspaceRead]` | `401` | only workspaces the caller belongs to |
+| `GET` | `/workspaces/{id}` | viewer+ in that workspace | `200 {…, members[]}` | `401`, `403` | membership checked against the path's workspace |
+| `POST` | `/workspaces/{id}/members` `{email, role, password?}` | admin+ in that workspace | `201 WorkspaceMemberRead` | `401`, `403`, `409 INVALID_STATE` (already a member), `422` | creates the account if the email is unknown; `password` is ignored for an existing account; `owner` is not grantable |
+
+Provisioning: Axiom has **no public registration**. The only path that creates a user is an admin adding them to a workspace. The first administrator is created once, by hand, with `python -m app.auth.bootstrap --email <email> --workspace <name>`; the command refuses to run when the database already has users.
+
+**Login rate limiting (step 2.7).** Redis counts *failures*, not attempts, so a user who mistypes once is not punished; a successful login clears the counter. Two limits apply: per account (5 failures / 60 s) and per source IP (30 failures / 60 s, higher because many users share one address). The window is fixed — the TTL starts at the first failure. If Redis is unreachable the limiter **fails open** and logs a warning: failing closed would turn a Redis outage into a total login outage, and the credential check still applies either way. `X-Forwarded-For` is deliberately not trusted, because a client could otherwise spoof it to escape the per-IP limit.
+
+### 8.2 Documents (Phase 2, step 2.5, implemented)
+
+Uploads are accepted as PDF only. The file is written to `<storage_root>/uploads/{document_id}/original.pdf` and the row is created in the same request; the `202` is returned only after **both** are durable. The `FileStorage` abstraction is deferred to Phase 3, but the on-disk layout is already fixed here so Phase 3 only extracts the interface.
+
+| Method | Endpoint | Role | Success | Errors | Scoping / state |
+|---|---|---|---|---|---|
+| `POST` | `/documents` (multipart PDF) | member+ | `202 {document_id, status:'queued'}` | `400 VALIDATION_ERROR` (not a PDF, empty, too large), `401`, `403` | `workspace_id` from membership; file written before the row is committed |
+| `GET` | `/documents?status_filter=&q=&limit=&offset=` | viewer+ | `200 {items, total}` ordered `(created_at,id)` | `401`, `403` | workspace-filtered in SQL; `q` matches filename only; limit 20 default / 100 max |
+| `GET` | `/documents/{id}` | viewer+ | `200` metadata+status+error | `401`, `404` (incl. other-workspace ids) | membership-checked |
+| `GET` | `/documents/{id}/file` | viewer+ | `200` file stream | `401`, `404`, `409` (still `uploaded`) | the only authorized path to the bytes; no local path is exposed |
+| `POST` | `/documents/{id}/retry` | member+ | `200 {document_id, status:'queued'}` | `401`, `404`, `409 INVALID_STATE` (not `failed`), `403` | clears the error, `attempts+1`; permanent-vs-transient split arrives with Phase 4 |
+| `DELETE` | `/documents/{id}` | admin+ | `204` | `401`, `404`, `409 INVALID_STATE` (in `processing/retrying`), `403` | file + row removed; chunks/runs cascade; citations keep their snapshots |
+
+Ordering rule for single-document routes: the **resource is resolved before the role is checked**, so a document in another workspace always answers `404` no matter which role the caller holds. A `403` would confirm that the id exists.
+
+### 8.2a Browser access (CORS, step 2.6)
+
+CORS is a **browser-enforced** policy, never an access-control mechanism: it decides whether JavaScript may *read* a response, and never who the caller is. The server always answers; the browser decides what to hand to the page. Non-browser clients (curl, httpx, the tests) are unaffected.
+
+Configured origins are explicit (`CORS_ORIGINS`, comma separated; default `http://localhost:5173`, the Vite dev server). The allowed request headers are `Authorization`, `Content-Type`, `X-Request-ID` and **`X-Workspace-ID`** — omitting the last one makes the browser's preflight fail and the real request is never sent. `X-Request-ID` is exposed so the frontend can show it in support requests.
+
+Axiom authenticates with a Bearer token, not a cookie, so `allow_credentials` is **off** and a wildcard origin is rejected by configuration. This matters: Starlette does not reject wildcard + credentials, it *echoes the request Origin back* and sets `Access-Control-Allow-Credentials: true`, which would let any website make credentialed cross-origin requests.
+
+Middleware order is `request_id → CORS → error boundary → router`. The error boundary sits **inside** CORS so that a 500 response still carries CORS headers; Starlette's plain `Exception` handler lives in `ServerErrorMiddleware`, outside the user middleware stack, and would leave the browser reporting a CORS error instead of a server error.
+
+### 8.3 Chat and conversations (Phase 5, not yet implemented)
+
+| Method | Endpoint | Role | Success | Errors | Scoping / state |
+|---|---|---|---|---|---|
+| `POST` | `/chat` `{conversation_id?, question, top_k?}` | viewer+ | `200 {message_id, answer, citations[{document_id,original_filename,page_number,passage_text,score}]}` or abstention `{answer, missing_evidence[]}` | `400/404` (bad/foreign conversation), `401`, `403`, `429` | retrieval filtered to workspace + `indexed` docs only; citations validated |
 | `GET` | `/conversations/{id}` | viewer+ own, admin+ any | `200` | `403/404` | creator-or-admin/owner |
 | `GET` | `/conversations/{id}/messages?limit=&offset=` | viewer+ own, admin+ any | `200 {items}` with citations | `403/404` | same rule; history survives doc delete (§3) |
 
