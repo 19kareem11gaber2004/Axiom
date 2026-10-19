@@ -166,7 +166,7 @@ Uploads are accepted as PDF only. The file is written to `<storage_root>/uploads
 
 Ordering rule for single-document routes: the **resource is resolved before the role is checked**, so a document in another workspace always answers `404` no matter which role the caller holds. A `403` would confirm that the id exists.
 
-### 8.2a Browser access (CORS, step 2.6)
+### 8.3 Browser access (CORS, step 2.6, implemented)
 
 CORS is a **browser-enforced** policy, never an access-control mechanism: it decides whether JavaScript may *read* a response, and never who the caller is. The server always answers; the browser decides what to hand to the page. Non-browser clients (curl, httpx, the tests) are unaffected.
 
@@ -176,7 +176,7 @@ Axiom authenticates with a Bearer token, not a cookie, so `allow_credentials` is
 
 Middleware order is `request_id → CORS → error boundary → router`. The error boundary sits **inside** CORS so that a 500 response still carries CORS headers; Starlette's plain `Exception` handler lives in `ServerErrorMiddleware`, outside the user middleware stack, and would leave the browser reporting a CORS error instead of a server error.
 
-### 8.3 Chat and conversations (Phase 5, not yet implemented)
+### 8.4 Chat and conversations (Phase 5, not yet implemented)
 
 | Method | Endpoint | Role | Success | Errors | Scoping / state |
 |---|---|---|---|---|---|
