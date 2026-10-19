@@ -1,19 +1,18 @@
 """Bounded integration smoke test.
 
-Requires real PostgreSQL and Redis (started via docker compose). Each
-connection attempt uses a short timeout; if the services are unavailable
-the test is skipped rather than failing, so the suite can run offline.
+Requires real PostgreSQL and Redis (started via docker compose, or any
+reachable instance). Each connection attempt uses a short timeout; if the
+services are unavailable the test is skipped rather than failing, so the
+suite can run offline.
 
 This test is NOT part of the offline CI gate; CI runs mocked readiness
 tests only. Integration smoke is executed manually after compose starts.
 """
 
-import os
-import time
-
 import psycopg
 import pytest
 import redis
+from sqlalchemy.engine import make_url
 
 from app.config import settings
 
@@ -21,11 +20,25 @@ PG_TIMEOUT = 3
 REDIS_TIMEOUT = 3
 
 
+def _psycopg_dsn(database_url: str) -> str:
+    """Convert a SQLAlchemy URL into a libpq/psycopg connection string.
+
+    settings.database_url is a SQLAlchemy URL such as
+    "postgresql+psycopg://user:pass@host:5432/db". psycopg.connect() only
+    understands the plain "postgresql://" scheme, so passing the URL
+    straight through raises ProgrammingError and the test would always skip.
+    """
+    url = make_url(database_url)
+    return url.set(drivername="postgresql").render_as_string(hide_password=False)
+
+
 @pytest.fixture
 def pg_conn():
     """Yield a psycopg connection to PostgreSQL, skipping if unavailable."""
     try:
-        conn = psycopg.connect(settings.database_url, connect_timeout=PG_TIMEOUT)
+        conn = psycopg.connect(
+            _psycopg_dsn(settings.database_url), connect_timeout=PG_TIMEOUT
+        )
     except Exception as exc:
         pytest.skip(f"PostgreSQL not available: {exc}")
     yield conn
@@ -73,3 +86,56 @@ def test_database_tables_exist(pg_conn):
         )
         count = cur.fetchone()[0]
     assert count == 9, f"expected 9 v0.1 tables, found {count}"
+
+
+def test_alembic_revision_is_applied(pg_conn):
+    """The database must be migrated to the latest revision."""
+    with pg_conn.cursor() as cur:
+        cur.execute("SELECT version_num FROM alembic_version")
+        row = cur.fetchone()
+    assert row is not None, "alembic_version is empty - run 'alembic upgrade head'"
+    assert row[0] == "0001", f"expected revision 0001, found {row[0]}"
+
+
+def test_enum_types_exist_once(pg_conn):
+    """Each shared ENUM type must exist exactly once with the expected values."""
+    with pg_conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT t.typname,
+                   string_agg(e.enumlabel, ',' ORDER BY e.enumsortorder)
+            FROM pg_type t
+            JOIN pg_enum e ON e.enumtypid = t.oid
+            JOIN pg_namespace n ON n.oid = t.typnamespace
+            WHERE n.nspname = 'public' AND t.typtype = 'e'
+            GROUP BY t.typname
+            """
+        )
+        enums = dict(cur.fetchall())
+
+    assert enums == {
+        "document_status": "uploaded,queued,processing,retrying,indexed,failed",
+        "membership_role": "owner,admin,member,viewer",
+        "message_role": "user,assistant",
+    }
+
+
+def test_pgvector_extension_and_column(pg_conn):
+    """pgvector must be installed and chunks.embedding must be vector(768)."""
+    with pg_conn.cursor() as cur:
+        cur.execute("SELECT count(*) FROM pg_extension WHERE extname = 'vector'")
+        assert cur.fetchone()[0] == 1, "vector extension is not installed"
+
+        cur.execute(
+            """
+            SELECT format_type(a.atttypid, a.atttypmod)
+            FROM pg_attribute a
+            JOIN pg_class c ON c.oid = a.attrelid
+            JOIN pg_namespace n ON n.oid = c.relnamespace
+            WHERE n.nspname = 'public' AND c.relname = 'chunks'
+              AND a.attname = 'embedding'
+            """
+        )
+        row = cur.fetchone()
+    assert row is not None, "chunks.embedding is missing"
+    assert row[0] == "vector(768)", f"expected vector(768), found {row[0]}"

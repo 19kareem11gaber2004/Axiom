@@ -32,6 +32,17 @@ def upgrade() -> None:
     op.execute("CREATE EXTENSION IF NOT EXISTS vector")
 
     # Enum types.
+    #
+    # create_type=False disables SQLAlchemy's automatic "CREATE TYPE" emission
+    # when a column using the type is created. Without it, each op.create_table()
+    # that references an enum column emits a second CREATE TYPE for the same
+    # name, and PostgreSQL rejects the migration with
+    # 'ERROR: type "document_status" already exists'.
+    #
+    # The types are created exactly once, explicitly, below - which keeps the
+    # creation point deterministic and guarantees every type exists before the
+    # tables that depend on it. This is the pattern recommended by SQLAlchemy
+    # for migrations rendered to SQL without database access.
     document_status = sa.Enum(
         "uploaded",
         "queued",
@@ -40,11 +51,14 @@ def upgrade() -> None:
         "indexed",
         "failed",
         name="document_status",
+        create_type=False,
     )
     membership_role = sa.Enum(
-        "owner", "admin", "member", "viewer", name="membership_role"
+        "owner", "admin", "member", "viewer", name="membership_role", create_type=False
     )
-    message_role = sa.Enum("user", "assistant", name="message_role")
+    message_role = sa.Enum(
+        "user", "assistant", name="message_role", create_type=False
+    )
 
     document_status.create(op.get_bind(), checkfirst=False)
     membership_role.create(op.get_bind(), checkfirst=False)
@@ -85,9 +99,7 @@ def upgrade() -> None:
         sa.Column("workspace_id", postgresql.UUID(as_uuid=True), nullable=False),
         sa.Column(
             "role",
-            sa.Enum(
-                "owner", "admin", "member", "viewer", name="membership_role"
-            ),
+            membership_role,
             nullable=False,
         ),
         sa.Column(
