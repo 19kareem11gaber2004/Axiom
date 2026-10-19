@@ -6,9 +6,9 @@ Axiom is an enterprise knowledge platform designed to help organizations ingest,
 
 The project follows an engineering-first approach, prioritizing secure data access, measurable retrieval quality, reliable infrastructure, and incremental delivery over a basic chatbot implementation.
 
-> **Current milestone:** Step 9 — Walking Skeleton  
-> **Current focus:** Backend infrastructure, database migrations, health checks, automated testing, Docker, and CI  
-> **Application status:** Infrastructure foundation; RAG capabilities are planned, not yet implemented.
+> **Current milestone:** Phase 2 — Backend Foundation  
+> **Current focus:** Authentication, workspace-scoped authorization, document management, and a tested persistence layer  
+> **Application status:** Secure API foundation; retrieval and generation are planned, not yet implemented.
 
 ---
 
@@ -49,29 +49,40 @@ The platform is being developed incrementally, beginning with a reliable backend
 
 ## Current Status
 
-The current milestone is the **Walking Skeleton**: a minimal, connected application environment that establishes the infrastructure required for subsequent development.
+The current milestone is the **Backend Foundation** (Phase 2): a secure, workspace-scoped API with authentication, document management, and a tested persistence layer.
 
 | Component | Current scope |
 |---|---|
-| FastAPI | Backend application and health endpoints |
-| PostgreSQL + pgvector | Persistent storage and vector-search infrastructure |
-| SQLAlchemy | Database models and persistence layer |
-| Alembic | Version-controlled database migrations |
-| Redis | Message-broker infrastructure |
+| FastAPI | Application, structured error envelope, request IDs, 12 versioned endpoints |
+| PostgreSQL + pgvector | Persistent storage, workspace-scoped schema, vector column |
+| SQLAlchemy | 9 models, composite foreign keys enforcing workspace isolation |
+| Alembic | Version-controlled migrations (revision `0001`, verified on a real pgvector server) |
+| Redis | Broker infrastructure **and** login rate limiting |
 | Celery | Asynchronous task-processing foundation |
 | Docker Compose | Local multi-service environment |
-| Pytest | Unit and integration test foundation |
-| GitHub Actions | Automated CI workflow |
+| Pytest | 153 tests: unit, HTTP, and real PostgreSQL/Redis integration |
+| GitHub Actions | Automated CI workflow (migration, tests, compose validation, image build) |
 
-The repository also contains initial application module boundaries for authentication, ingestion, retrieval, storage, and AI workflows. Their presence does not mean those capabilities are implemented.
+### Implemented endpoints
+
+```
+POST   /api/v1/auth/login                  POST   /api/v1/auth/logout
+GET    /api/v1/auth/me                     POST   /api/v1/workspaces
+GET    /api/v1/workspaces                  GET    /api/v1/workspaces/{id}
+POST   /api/v1/workspaces/{id}/members     POST   /api/v1/documents
+GET    /api/v1/documents                   GET    /api/v1/documents/{id}
+GET    /api/v1/documents/{id}/file         POST   /api/v1/documents/{id}/retry
+DELETE /api/v1/documents/{id}
+```
+
+Every error uses one envelope: `{"error": {"code", "message", "retryable", "request_id"}}`.
 
 ### Not implemented yet
 
-- Authentication and workspace authorization
-- Document upload and ingestion
-- PDF extraction and chunking
-- Embedding generation and retrieval pipelines
+- Background document processing (the Celery worker and PDF extraction)
+- Chunking, embedding generation, and retrieval
 - RAG answer generation and citation validation
+- Conversations and chat
 - Hybrid retrieval and reranking
 - Multimodal processing
 - Agentic workflows and human-in-the-loop approval
@@ -249,6 +260,26 @@ This applies the migration history to the configured PostgreSQL database.
 
 A successful migration is required before the application can rely on the schema. If it fails, inspect the database connection settings, service health, extension availability, and migration logs.
 
+### 5a. Create the first administrator
+
+Axiom has **no public registration**. The only way a user account is created is an administrator adding it to a workspace, and the very first administrator has to be created by hand:
+
+```powershell
+Set-Location backend
+python -m app.auth.bootstrap --email admin@example.com --workspace "My Workspace"
+Set-Location ..
+```
+
+The command prompts for the password (or reads it from `BOOTSTRAP_PASSWORD`). It refuses to run when the database already contains users, so it can never mint a second administrator unnoticed.
+
+Generate a strong signing key for anything other than local development:
+
+```powershell
+python -c "import secrets; print(secrets.token_urlsafe(48))"
+```
+
+Put the result in `JWT_SECRET_KEY` in `.env`. The application **refuses to start** with the placeholder secret when `ENV` is not `dev`.
+
 ### 6. Start the API and worker
 
 Build the backend image and start the application services:
@@ -310,6 +341,27 @@ If a required dependency is unavailable, the readiness endpoint is expected to r
 
 These are expected response contracts, not claims that the current implementation has already passed a live runtime check.
 
+### Authenticate and call a protected endpoint
+
+```powershell
+$login = Invoke-RestMethod -Method Post `
+  -Uri http://localhost:8000/api/v1/auth/login `
+  -ContentType "application/json" `
+  -Body '{"email":"admin@example.com","password":"<the password you chose>"}'
+
+$headers = @{ Authorization = "Bearer $($login.access_token)" }
+Invoke-RestMethod http://localhost:8000/api/v1/auth/me -Headers $headers
+```
+
+Expected: the caller as resolved **on the server** - id, email, `workspace_id` and `role`. The workspace and role come from the database, never from the token.
+
+Create a workspace (the caller becomes its `owner`):
+
+```powershell
+Invoke-RestMethod -Method Post -Uri http://localhost:8000/api/v1/workspaces `
+  -ContentType "application/json" -Body '{"name":"My Workspace"}' -Headers $headers
+```
+
 ---
 
 ## Running Tests
@@ -320,6 +372,16 @@ Run tests from the repository root unless a command explicitly changes directori
 
 ```powershell
 Set-Location backend
+python -m pytest -q
+Set-Location ..
+```
+
+The suite contains 153 tests. Tests that need PostgreSQL or Redis are **skipped** when those services are unreachable, so the suite still runs offline:
+
+```powershell
+Set-Location backend
+$env:DATABASE_URL = "postgresql+psycopg://axiom:axiom@localhost:5432/axiom"
+$env:REDIS_URL = "redis://localhost:6379/0"
 python -m pytest -q
 Set-Location ..
 ```
@@ -451,20 +513,42 @@ Axiom/
 │   │   ├── ai_workflow/
 │   │   ├── api/
 │   │   ├── auth/
+│   │   │   ├── bootstrap.py
+│   │   │   ├── dependencies.py
+│   │   │   ├── rate_limit.py
+│   │   │   └── service.py
 │   │   ├── db/
-│   │   │   └── models.py
+│   │   │   ├── models.py
+│   │   │   └── session.py
 │   │   ├── ingestion/
+│   │   │   └── validation.py
 │   │   ├── retrieval/
 │   │   ├── storage/
+│   │   │   └── uploads.py
 │   │   ├── worker/
 │   │   │   └── celery_app.py
+│   │   ├── api/
+│   │   │   ├── errors.py
+│   │   │   ├── schemas.py
+│   │   │   └── routes/
+│   │   │       ├── auth.py
+│   │   │       ├── documents.py
+│   │   │       └── workspaces.py
 │   │   ├── config.py
 │   │   └── main.py
 │   ├── tests/
 │   │   ├── conftest.py
+│   │   ├── test_auth_dependencies.py
+│   │   ├── test_auth_service.py
+│   │   ├── test_cors.py
+│   │   ├── test_documents.py
+│   │   ├── test_errors.py
 │   │   ├── test_health.py
+│   │   ├── test_migration_sql.py
+│   │   ├── test_rate_limit.py
 │   │   ├── test_ready.py
-│   │   └── test_smoke_integration.py
+│   │   ├── test_smoke_integration.py
+│   │   └── test_workspaces.py
 │   ├── Dockerfile
 │   ├── alembic.ini
 │   ├── requirements.txt
@@ -483,7 +567,7 @@ Axiom/
 └── README.md
 ```
 
-The tree illustrates the intended repository layout. Empty modules and evaluation assets are scaffolding until their associated functionality and validation are implemented.
+The `retrieval/` module is still empty: retrieval is not implemented yet.
 
 ---
 
@@ -491,16 +575,16 @@ The tree illustrates the intended repository layout. Empty modules and evaluatio
 
 Axiom will progress through incremental milestones with explicit acceptance criteria.
 
-| Phase | Milestone | Primary deliverables |
-|---|---|---|
-| 1 | Walking Skeleton | Application startup, infrastructure, migrations, health checks, tests, and CI |
-| 2 | Backend Foundations | Configuration, persistence, and workspace-scoped data access |
-| 3 | Authentication and Authorization | Secure identities and enforced workspace isolation |
-| 4 | Document Ingestion | Upload validation, background processing, and document lifecycle management |
-| 5 | PDF RAG MVP | PDF extraction, chunking, embeddings, retrieval, citations, and abstention |
-| 6 | Retrieval Evaluation | Baselines, vector-versus-hybrid comparisons, reranking experiments, and quality metrics |
-| 7 | Multimodal Retrieval | Evaluated extensions for additional document modalities |
-| 8 | Agentic Workflows | Controlled tool use, workflow orchestration, and human review where appropriate |
+| Phase | Milestone | Primary deliverables | Status |
+|---|---|---|---|
+| 1 | Walking Skeleton | Application startup, infrastructure, migrations, health checks, tests, and CI | Done |
+| 2 | Backend Foundation | Configuration, persistence, authentication, workspace-scoped authorization, document management, error envelope, CORS, rate limiting | Done |
+| 3 | Document Ingestion | File storage abstraction, duplicate detection, and the upload lifecycle | Next |
+| 4 | Background Processing | Celery worker, database claim, sweeper, retries, and failure recovery | Planned |
+| 5 | PDF RAG MVP | PDF extraction, chunking, embeddings, retrieval, citations, and abstention | Planned |
+| 6 | Retrieval Evaluation | Baselines, vector-versus-hybrid comparisons, reranking experiments, and quality metrics | Planned |
+| 7 | Multimodal Retrieval | Evaluated extensions for additional document modalities | Planned |
+| 8 | Agentic Workflows | Controlled tool use, workflow orchestration, and human review where appropriate | Planned |
 
 Phase 6 will build on the PDF MVP rather than expanding the system before a measurable retrieval baseline exists. Its comparisons will be driven by evaluation results instead of assumptions that more complex retrieval is automatically better.
 
@@ -530,14 +614,17 @@ Complete and verify one milestone before adding complexity. Document important a
 
 ## Current Limitations
 
-- Axiom is currently an infrastructure foundation, not a functioning RAG application.
-- Authentication and authorization have not yet been implemented.
-- Document upload, parsing, indexing, and answer generation are not available yet.
-- pgvector infrastructure does not, by itself, constitute an implemented retrieval pipeline.
-- The evaluation directory provides scaffolding; it does not establish retrieval or generation quality.
-- Docker and CI configuration must be verified through actual runtime and workflow executions.
-- Local credentials and development settings are not suitable for production.
-- Container privilege settings, worker execution permissions, secret handling, and other security controls require verification against the actual configuration before deployment.
+- Axiom is currently a secure API foundation, not a functioning RAG application. No answer is generated yet.
+- **No background processing.** Uploads are validated, stored, and queued, but no Celery task consumes the queue: documents stay in `queued` until the worker lands in Phase 4.
+- **Access tokens are stateless.** `POST /auth/logout` cannot revoke a token on the server; the client discards it. There is no token blocklist and no refresh token. Workspace and role are re-read from the database on every request, so a revoked membership or a demotion takes effect immediately.
+- **The login rate limiter fails open.** If Redis is unreachable the limiter is bypassed and a warning is logged, because failing closed would turn a Redis outage into a total login outage. The credential check still applies.
+- **`X-Forwarded-For` is not trusted.** The per-IP login limit sees the proxy address behind a reverse proxy. Honouring the header is a deployment concern, because a client could otherwise spoof it to escape the limit.
+- **The document file store is local.** Files live under `backend/storage/` and are removed with the document. The `FileStorage` abstraction that allows an object store arrives in Phase 3.
+- **Only PDF uploads are accepted**, and only a plain `%PDF-` signature is checked. Page count, character count, and processing-time limits arrive with the worker.
+- **No `audit_logs` table yet.** Document deletion writes a structured log line; the permanent audit trail is Phase 10.
+- **The evaluation directory is scaffolding.** It provides a frozen corpus, a schema, and 20 seed questions, but no retrieval or generation quality has been measured.
+- **Local credentials and development settings are not suitable for production.** The application refuses to start with the placeholder `JWT_SECRET_KEY` when `ENV` is not `dev`.
+- Container privilege settings, worker execution permissions, and secret handling require verification against the deployed configuration before production use.
 
 ---
 
