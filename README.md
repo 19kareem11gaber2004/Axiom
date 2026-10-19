@@ -53,7 +53,7 @@ The current milestone is the **Backend Foundation** (Phase 2): a secure, workspa
 
 | Component | Current scope |
 |---|---|
-| FastAPI | Application, structured error envelope, request IDs, 12 versioned endpoints |
+| FastAPI | Application, structured error envelope, request IDs, 10 versioned endpoints under `/api/v1` |
 | PostgreSQL + pgvector | Persistent storage, workspace-scoped schema, vector column |
 | SQLAlchemy | 9 models, composite foreign keys enforcing workspace isolation |
 | Alembic | Version-controlled migrations (revision `0001`, verified on a real pgvector server) |
