@@ -20,6 +20,7 @@ Design notes
 """
 
 import logging
+import time
 from typing import Optional, Tuple
 
 import redis
@@ -31,7 +32,13 @@ logger = logging.getLogger("axiom.ratelimit")
 # Namespace for every key this module writes.
 KEY_PREFIX = "axiom:ratelimit:login:"
 
+# How long to wait before trying Redis again after a failure. Without this
+# every call would pay the full connection timeout while Redis is down.
+RECONNECT_BACKOFF_SECONDS = 30
+
 _client: Optional[redis.Redis] = None
+_next_attempt_at: float = 0.0
+_redis_reported_down: bool = False
 
 
 def get_client() -> Optional[redis.Redis]:
@@ -39,20 +46,42 @@ def get_client() -> Optional[redis.Redis]:
 
     The client is created lazily so importing this module never opens a
     connection, and a failed connection never raises.
+
+    When Redis is down the failure is remembered for a short while, so a
+    burst of requests does not each pay the connection timeout, and the
+    warning is logged on the transition rather than on every call.
     """
-    global _client
-    if _client is None:
-        try:
-            client = redis.Redis.from_url(
-                settings.redis_url,
-                socket_connect_timeout=2,
-                socket_timeout=2,
+    global _client, _next_attempt_at, _redis_reported_down
+
+    if _client is not None:
+        return _client
+
+    now = time.monotonic()
+    if now < _next_attempt_at:
+        return None
+
+    try:
+        client = redis.Redis.from_url(
+            settings.redis_url,
+            socket_connect_timeout=2,
+            socket_timeout=2,
+        )
+        client.ping()
+    except Exception as exc:  # noqa: BLE001 - boundary
+        _next_attempt_at = now + RECONNECT_BACKOFF_SECONDS
+        if not _redis_reported_down:
+            logger.warning(
+                "Rate limiting unavailable: %s. Login attempts are not being "
+                "limited until Redis is reachable again.", exc
             )
-            client.ping()
-            _client = client
-        except Exception as exc:  # noqa: BLE001 - boundary
-            logger.warning("Rate limiting unavailable: %s", exc)
-            return None
+            _redis_reported_down = True
+        return None
+
+    _client = client
+    _next_attempt_at = 0.0
+    if _redis_reported_down:
+        logger.info("Rate limiting is available again.")
+        _redis_reported_down = False
     return _client
 
 

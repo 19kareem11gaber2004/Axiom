@@ -35,9 +35,14 @@ def redis_client():
 
 @pytest.fixture
 def clean_counters():
+    """Reset the module's cached client and backoff state."""
     rate_limit._client = None
+    rate_limit._next_attempt_at = 0.0
+    rate_limit._redis_reported_down = False
     yield
     rate_limit._client = None
+    rate_limit._next_attempt_at = 0.0
+    rate_limit._redis_reported_down = False
 
 
 def test_a_fresh_identifier_is_not_blocked(redis_client, clean_counters):
@@ -116,6 +121,53 @@ def test_rate_limiting_fails_open_when_redis_is_down(monkeypatch, clean_counters
     # Recording and resetting must also be no-ops rather than raising.
     rate_limit.record_failure("email", "someone@example.com")
     rate_limit.reset("email", "someone@example.com")
+
+
+def test_a_down_redis_is_not_reconnected_on_every_call(monkeypatch, clean_counters):
+    """A burst of requests must not each pay the connection timeout.
+
+    Without the backoff, every call would retry the connection and wait
+    the full timeout while Redis is down.
+    """
+    attempts = []
+
+    class Boom:
+        def ping(self):
+            raise RuntimeError("redis is down")
+
+    def fake_from_url(*args, **kwargs):
+        attempts.append(1)
+        return Boom()
+
+    monkeypatch.setattr(rate_limit.redis.Redis, "from_url", fake_from_url)
+
+    for _ in range(5):
+        assert rate_limit.get_client() is None
+    assert len(attempts) == 1, "Redis was contacted %d times" % len(attempts)
+
+    # After the backoff window a reconnect is attempted again.
+    rate_limit._next_attempt_at = 0.0
+    assert rate_limit.get_client() is None
+    assert len(attempts) == 2
+
+
+def test_the_outage_is_logged_once_not_on_every_call(monkeypatch, clean_counters, caplog):
+    """A Redis outage must not flood the log with one warning per request."""
+    class Boom:
+        def ping(self):
+            raise RuntimeError("redis is down")
+
+    monkeypatch.setattr(
+        rate_limit.redis.Redis, "from_url", lambda *a, **k: Boom()
+    )
+
+    with caplog.at_level("WARNING", logger="axiom.ratelimit"):
+        for _ in range(4):
+            rate_limit.get_client()
+
+    warnings = [r for r in caplog.records if r.levelname == "WARNING"]
+    assert len(warnings) == 1, "expected 1 warning, got %d" % len(warnings)
+    assert "not being limited" in warnings[0].message
 
 
 # ---------------------------------------------------------------------------
