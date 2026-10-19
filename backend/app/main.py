@@ -12,9 +12,17 @@ from typing import Optional
 from fastapi import FastAPI, Request, Response
 from fastapi.responses import JSONResponse
 
+from app.api.errors import register_error_handlers
+from app.api.routes import auth as auth_routes
+from app.api.routes import documents as document_routes
+from app.api.routes import workspaces as workspace_routes
 from app.config import settings
 
 app = FastAPI(title="Axiom", version="0.1.0")
+register_error_handlers(app)
+app.include_router(auth_routes.router)
+app.include_router(workspace_routes.router)
+app.include_router(document_routes.router)
 
 # Request ID must be 1–64 characters and contain only safe header characters.
 REQUEST_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
@@ -36,6 +44,9 @@ def _validate_request_id(value: Optional[str]) -> Optional[str]:
 async def request_id_middleware(request: Request, call_next):
     client_id = request.headers.get("x-request-id")
     request_id = _validate_request_id(client_id) or _generate_request_id()
+    # Store on request.state so error handlers and route handlers can echo
+    # the same ID back to the client and include it in logs.
+    request.state.request_id = request_id
     response: Response = await call_next(request)
     response.headers["x-request-id"] = request_id
     return response

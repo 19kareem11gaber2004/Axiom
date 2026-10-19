@@ -18,7 +18,7 @@ Key deletion behaviors:
 """
 
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 
 from pgvector.sqlalchemy import Vector
 from sqlalchemy import (
@@ -46,7 +46,10 @@ def _uuid() -> uuid.UUID:
 
 
 def _now() -> datetime:
-    return datetime.utcnow()
+    # Timezone-aware UTC. The columns are DateTime(timezone=True), so a
+    # naive datetime (the old datetime.utcnow()) would be inconsistent
+    # with what PostgreSQL stores and returns.
+    return datetime.now(timezone.utc)
 
 
 DocumentStatus = Enum(

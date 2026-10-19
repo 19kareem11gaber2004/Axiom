@@ -12,24 +12,12 @@ tests only. Integration smoke is executed manually after compose starts.
 import psycopg
 import pytest
 import redis
-from sqlalchemy.engine import make_url
 
 from app.config import settings
+from conftest import psycopg_dsn
 
 PG_TIMEOUT = 3
 REDIS_TIMEOUT = 3
-
-
-def _psycopg_dsn(database_url: str) -> str:
-    """Convert a SQLAlchemy URL into a libpq/psycopg connection string.
-
-    settings.database_url is a SQLAlchemy URL such as
-    "postgresql+psycopg://user:pass@host:5432/db". psycopg.connect() only
-    understands the plain "postgresql://" scheme, so passing the URL
-    straight through raises ProgrammingError and the test would always skip.
-    """
-    url = make_url(database_url)
-    return url.set(drivername="postgresql").render_as_string(hide_password=False)
 
 
 @pytest.fixture
@@ -37,7 +25,7 @@ def pg_conn():
     """Yield a psycopg connection to PostgreSQL, skipping if unavailable."""
     try:
         conn = psycopg.connect(
-            _psycopg_dsn(settings.database_url), connect_timeout=PG_TIMEOUT
+            psycopg_dsn(settings.database_url), connect_timeout=PG_TIMEOUT
         )
     except Exception as exc:
         pytest.skip(f"PostgreSQL not available: {exc}")
