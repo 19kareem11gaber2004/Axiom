@@ -1,58 +1,197 @@
 # Axiom — Multimodal Enterprise RAG Platform
 
-Axiom is an enterprise intelligence platform designed to help organizations ingest, search, and reason over internal knowledge. The long-term goal is to support multimodal retrieval, grounded answers with citations, and reliable AI-powered workflows.
+**Building reliable enterprise AI systems, one verified milestone at a time.**
 
-> **Current status:** Step 9 — Walking Skeleton  
-> **Scope:** Backend infrastructure, database schema, health checks, automated tests, containerization, and CI.
+Axiom is an enterprise knowledge platform designed to help organizations ingest, search, and reason over internal information. Its long-term vision is to provide grounded answers with traceable citations, multimodal retrieval, and controlled AI-powered workflows.
 
-## Overview
+The project follows an engineering-first approach, prioritizing secure data access, measurable retrieval quality, reliable infrastructure, and incremental delivery over a basic chatbot implementation.
 
-This milestone establishes the foundation required to develop Axiom safely and incrementally. It connects the core backend services and verifies that the application can start, access its dependencies, apply database migrations, and run automated checks.
+> **Current milestone:** Step 9 — Walking Skeleton  
+> **Current focus:** Backend infrastructure, database migrations, health checks, automated testing, Docker, and CI  
+> **Application status:** Infrastructure foundation; RAG capabilities are planned, not yet implemented.
 
-The current implementation includes:
+---
 
-- **FastAPI** — backend application and health endpoints.
-- **PostgreSQL with pgvector** — persistent data storage and vector-search infrastructure.
-- **Redis** — message broker and supporting infrastructure.
-- **Celery** — asynchronous task-processing foundation.
-- **SQLAlchemy and Alembic** — database models and version-controlled schema migrations.
-- **Docker Compose** — local multi-service development environment.
-- **Pytest** — automated unit and integration tests.
-- **GitHub Actions** — continuous integration on pushes and pull requests.
+## Table of Contents
 
-**What is not implemented yet:** Authentication, document ingestion, PDF processing, retrieval pipelines, RAG generation, and AI workflows. These capabilities will be introduced in later phases.
+- [Project Overview](#project-overview)
+- [Current Status](#current-status)
+- [Architecture](#architecture)
+- [Technology Stack](#technology-stack)
+- [Prerequisites](#prerequisites)
+- [Getting Started](#getting-started)
+- [Running Tests](#running-tests)
+- [Validation Checks](#validation-checks)
+- [Health and Readiness Checks](#health-and-readiness-checks)
+- [Continuous Integration](#continuous-integration)
+- [Project Structure](#project-structure)
+- [Development Roadmap](#development-roadmap)
+- [Engineering Principles](#engineering-principles)
+- [Current Limitations](#current-limitations)
+- [Stopping the Environment](#stopping-the-environment)
+
+---
+
+## Project Overview
+
+Enterprise knowledge is often distributed across documents and internal systems. Axiom aims to provide a foundation for retrieving relevant information and generating answers grounded in verifiable evidence.
+
+The platform is being developed incrementally, beginning with a reliable backend foundation before introducing document processing, retrieval, and generation.
+
+### Core objectives
+
+- **Grounded generation:** Generate answers supported by retrieved evidence and traceable citations.
+- **Workspace isolation:** Prevent unauthorized access to other workspaces' documents and data.
+- **Reliable ingestion:** Process documents asynchronously with explicit lifecycle states.
+- **Retrieval evaluation:** Measure retrieval quality and track regressions using evaluation datasets.
+- **Operational reliability:** Apply database migrations, automated tests, health checks, and continuous integration.
+- **Controlled AI workflows:** Introduce tool use and human approval when justified by the use case.
+
+## Current Status
+
+The current milestone is the **Walking Skeleton**: a minimal, connected application environment that establishes the infrastructure required for subsequent development.
+
+| Component | Current scope |
+|---|---|
+| FastAPI | Backend application and health endpoints |
+| PostgreSQL + pgvector | Persistent storage and vector-search infrastructure |
+| SQLAlchemy | Database models and persistence layer |
+| Alembic | Version-controlled database migrations |
+| Redis | Message-broker infrastructure |
+| Celery | Asynchronous task-processing foundation |
+| Docker Compose | Local multi-service environment |
+| Pytest | Unit and integration test foundation |
+| GitHub Actions | Automated CI workflow |
+
+The repository also contains initial application module boundaries for authentication, ingestion, retrieval, storage, and AI workflows. Their presence does not mean those capabilities are implemented.
+
+### Not implemented yet
+
+- Authentication and workspace authorization
+- Document upload and ingestion
+- PDF extraction and chunking
+- Embedding generation and retrieval pipelines
+- RAG answer generation and citation validation
+- Hybrid retrieval and reranking
+- Multimodal processing
+- Agentic workflows and human-in-the-loop approval
+
+These capabilities will be introduced in later milestones and verified through explicit acceptance criteria.
+
+---
+
+## Architecture
+
+Axiom begins as a **modular monolith**: one backend application with clearly separated internal responsibilities, supported by dedicated infrastructure services.
+
+```text
+                    Client Applications
+                            |
+                            v
+                      FastAPI API
+                            |
+             +--------------+--------------+
+             |                             |
+             v                             v
+        PostgreSQL                      Redis
+        + pgvector                        |
+             |                            v
+             |                       Celery Worker
+             |                            |
+             +----------------------------+
+                   Shared Infrastructure
+```
+
+The diagram represents the planned service relationships at the infrastructure level. Document-processing and retrieval workflows will be added in subsequent milestones.
+
+### Architectural responsibilities
+
+- **API layer:** Exposes HTTP endpoints and handles incoming requests.
+- **Database layer:** Persists application data and will support vector retrieval.
+- **Message broker:** Redis provides the transport infrastructure for background tasks.
+- **Worker layer:** Celery provides the execution environment for asynchronous jobs.
+- **Migration layer:** Alembic manages version-controlled database schema changes.
+- **CI pipeline:** Validates migrations, tests, configuration, and the backend image.
+
+The initial migration is intended to establish nine application tables, together with the required PostgreSQL extension, enum types, constraints, and indexes. The actual migration must be executed successfully against PostgreSQL to verify the resulting schema.
+
+---
+
+## Technology Stack
+
+| Category | Technology | Purpose |
+|---|---|---|
+| Language | Python 3.12 | Backend development |
+| API framework | FastAPI | HTTP API and health endpoints |
+| Database | PostgreSQL | Persistent application data |
+| Vector infrastructure | pgvector | Vector storage and similarity-search support |
+| ORM | SQLAlchemy | Database interaction |
+| Migrations | Alembic | Schema versioning |
+| Message broker | Redis | Background-task transport |
+| Task processing | Celery | Asynchronous job execution |
+| Containerization | Docker | Reproducible application environment |
+| Orchestration | Docker Compose | Local multi-service development |
+| Testing | Pytest | Automated verification |
+| CI/CD foundation | GitHub Actions | Automated validation on pushes and pull requests |
+
+---
 
 ## Prerequisites
 
-Install the following before starting:
+Ensure the following tools are installed:
 
-- Windows 10 or 11.
-- Docker Desktop with the Docker Engine running.
-- Python 3.12 for local backend development.
-- Git.
-- PowerShell 5.1 or later.
+- Windows 10 or 11
+- Docker Desktop with the Docker Engine running
+- Python 3.12
+- Git
+- PowerShell 5.1 or later
 
-Docker Desktop provides the container runtime and Docker Compose used to run the infrastructure services.
+Verify your installations:
 
-## Quick Start — Windows PowerShell
+```powershell
+python --version
+git --version
+docker --version
+docker compose version
+```
 
-Run the following commands from the repository root:
+Python should report version 3.12.x. Docker commands should work with the running Docker Engine.
 
-`C:\Users\kioskUser0\Axiom`
+---
 
-### 1. Configure the environment
+## Getting Started
 
-Create a local environment file from the example:
+The following instructions describe the intended local-development workflow on Windows PowerShell.
+
+### 1. Clone the repository
+
+If you have not already cloned Axiom:
+
+```powershell
+git clone https://github.com/19kareem11gaber2004/Axiom.git
+Set-Location Axiom
+```
+
+If the repository is already available locally, navigate to its root directory instead.
+
+### 2. Configure environment variables
+
+Create your local environment file:
 
 ```powershell
 Copy-Item .env.example .env
 ```
 
-Review `.env` and ensure the database and Redis connection strings match the service names and ports configured in `docker-compose.yml`.
+Review `.env` and confirm that the PostgreSQL and Redis connection strings match the service names, ports, and credentials configured in `docker-compose.yml`.
 
-The `.env` file contains local configuration and must not be committed to Git. Use real secrets only through appropriate secret-management mechanisms in deployed environments.
+**Security notes:**
 
-### 2. Start PostgreSQL and Redis
+- Never commit `.env` or real credentials.
+- Keep `.env.example` limited to safe placeholders.
+- Use a secrets manager or deployment-platform secrets for production credentials.
+- Do not reuse disposable development credentials in production.
+
+### 3. Start infrastructure services
 
 Make sure Docker Desktop is running, then execute:
 
@@ -60,61 +199,82 @@ Make sure Docker Desktop is running, then execute:
 docker compose up -d postgres redis
 ```
 
-Check the container status:
+Check the service status:
 
 ```powershell
 docker compose ps
 ```
 
-Wait until both services report healthy status before proceeding.
+Wait for PostgreSQL and Redis to become healthy before proceeding. If either service fails, inspect its logs:
 
-### 3. Apply database migrations
+```powershell
+docker compose logs postgres
+docker compose logs redis
+```
 
-From the repository root:
+### 4. Install backend dependencies
+
+Create and activate a virtual environment if you do not already have one:
+
+```powershell
+py -3.12 -m venv .venv
+.\.venv\Scripts\Activate.ps1
+```
+
+Install the backend dependencies:
+
+```powershell
+python -m pip install -r backend/requirements.txt
+```
+
+If the development requirements file is separate, install it as well:
+
+```powershell
+python -m pip install -r backend/requirements-dev.txt
+```
+
+Run these commands from the repository root. If PowerShell blocks virtual-environment activation, review your local execution policy rather than changing system-wide settings unnecessarily.
+
+### 5. Apply database migrations
+
+Run:
 
 ```powershell
 Set-Location backend
-```
-
-Install the backend dependencies if they are not already installed in your active Python environment:
-
-```powershell
-python -m pip install -r requirements.txt
-```
-
-Apply the database schema:
-
-```powershell
 python -m alembic upgrade head
-```
-
-Return to the repository root:
-
-```powershell
 Set-Location ..
 ```
 
-The initial migration is intended to create the v0.1 database schema, including the nine application tables, PostgreSQL vector extension, enum types, constraints, and indexes. The migration must complete successfully before the application can use the schema.
+This applies the migration history to the configured PostgreSQL database.
 
-### 4. Start the API and worker
+A successful migration is required before the application can rely on the schema. If it fails, inspect the database connection settings, service health, extension availability, and migration logs.
+
+### 6. Start the API and worker
+
+Build the backend image and start the application services:
 
 ```powershell
 docker compose up --build api worker
 ```
 
-The API should become available at:
+The services run in the foreground, allowing you to inspect their logs.
 
-`http://localhost:8000`
-
-Keep this terminal open to inspect service logs. To run the services in the background instead, use:
+To start them in the background instead:
 
 ```powershell
 docker compose up -d --build api worker
 ```
 
-### 5. Verify the API
+The API is expected to be available at:
 
-Check the liveness endpoint:
+- API base URL: http://localhost:8000
+- Interactive API documentation: http://localhost:8000/docs
+
+The actual routes and documentation settings are determined by the running FastAPI application.
+
+### 7. Verify the application
+
+Check API liveness:
 
 ```powershell
 Invoke-RestMethod http://localhost:8000/health
@@ -134,7 +294,7 @@ Check dependency readiness:
 Invoke-RestMethod http://localhost:8000/ready
 ```
 
-When PostgreSQL and Redis are available, the expected response is:
+Expected response when both dependencies are available:
 
 ```json
 {
@@ -146,17 +306,17 @@ When PostgreSQL and Redis are available, the expected response is:
 }
 ```
 
-If a dependency is unavailable, the readiness endpoint is expected to return HTTP 503 with a `not_ready` status.
+If a required dependency is unavailable, the readiness endpoint is expected to return HTTP 503 with a `not_ready` status.
 
-These are expected responses; verify them against the running application rather than assuming the checks have already passed.
+These are expected response contracts, not claims that the current implementation has already passed a live runtime check.
+
+---
 
 ## Running Tests
 
-Run commands from the repository root unless stated otherwise.
+Run tests from the repository root unless a command explicitly changes directories.
 
 ### Unit tests
-
-Unit tests use the in-process FastAPI application and mocked dependency checks, so they should not require running PostgreSQL or Redis.
 
 ```powershell
 Set-Location backend
@@ -164,9 +324,11 @@ python -m pytest -q
 Set-Location ..
 ```
 
+Unit tests are intended to verify application behavior without requiring live infrastructure when dependencies are appropriately mocked.
+
 ### Integration smoke test
 
-The integration test requires PostgreSQL and Redis to be running and configured through the project's environment settings.
+Start PostgreSQL and Redis first, then run:
 
 ```powershell
 Set-Location backend
@@ -174,11 +336,19 @@ python -m pytest -q tests/test_smoke_integration.py
 Set-Location ..
 ```
 
-The test is intended to verify database connectivity, Redis connectivity, and the existence of the nine v0.1 application tables.
+The integration test is intended to verify:
 
-## Static Validation
+- PostgreSQL connectivity
+- Redis connectivity
+- The existence of the nine expected application tables
 
-The following checks help catch common issues before running the full stack.
+The test must use the correct environment configuration and a successfully migrated database.
+
+---
+
+## Validation Checks
+
+These checks provide additional confidence in the repository before integration or deployment.
 
 ### Python compilation
 
@@ -188,15 +358,17 @@ From the repository root:
 python -m compileall -q backend/app backend/tests backend/alembic
 ```
 
+This checks Python syntax and compiles the selected modules. It does not validate application behavior or external dependencies.
+
 ### Offline migration SQL
 
-Run from the `backend` directory:
+From the `backend` directory:
 
 ```powershell
 python -m alembic upgrade head --sql
 ```
 
-This generates migration SQL without applying it to the database. It does not prove that the migration will execute successfully against a live PostgreSQL instance.
+This generates migration SQL without applying it to the database. A successful run does not prove that the migration will execute successfully against a live PostgreSQL instance.
 
 ### Docker Compose configuration
 
@@ -206,26 +378,62 @@ From the repository root:
 docker compose config --quiet
 ```
 
-### GitHub Actions YAML validation
+This checks whether Docker Compose can parse and resolve the configuration. It does not prove that every service will start successfully.
 
-If PyYAML is installed in your active Python environment:
+### GitHub Actions workflow syntax
+
+If PyYAML is installed:
 
 ```powershell
 python -c "import yaml; yaml.safe_load(open('.github/workflows/ci.yml', encoding='utf-8')); print('YAML parsed successfully')"
 ```
 
-A successful parse checks YAML syntax; it does not guarantee that the workflow will pass on GitHub.
+This checks YAML parsing only. A successful parse does not guarantee that GitHub Actions will execute the workflow successfully.
 
-## Docker Compose Services
+---
 
-| Service | Responsibility |
+## Health and Readiness Checks
+
+Axiom distinguishes between two operational checks:
+
+| Endpoint | Responsibility |
 |---|---|
-| `api` | Serves the FastAPI application and HTTP endpoints. |
-| `postgres` | Stores application data in PostgreSQL with pgvector support. |
-| `redis` | Provides the message-broker infrastructure used by the worker. |
-| `worker` | Provides the Celery task-processing runtime. |
+| `/health` | Reports whether the API process is alive and responding |
+| `/ready` | Checks whether the API's required dependencies are available |
 
-The exact ports, health checks, environment variables, and dependency relationships are defined in `docker-compose.yml`.
+**Liveness** helps determine whether the application process is running.
+
+**Readiness** helps determine whether the application can serve requests that depend on its infrastructure.
+
+Keeping these checks separate makes local debugging and future deployment health monitoring more reliable.
+
+---
+
+## Continuous Integration
+
+The GitHub Actions workflow is located at:
+
+```text
+.github/workflows/ci.yml
+```
+
+It is designed to validate the project on pushes and pull requests.
+
+The intended pipeline includes:
+
+1. Provisioning PostgreSQL with pgvector and Redis service containers.
+2. Setting up Python 3.12.
+3. Installing development dependencies.
+4. Applying Alembic migrations.
+5. Running automated tests.
+6. Validating the Docker Compose configuration.
+7. Building the backend Docker image.
+
+CI helps identify regressions before changes are merged. It does not automatically repair faulty code or guarantee production readiness.
+
+A workflow is considered verified only after an actual GitHub Actions run completes successfully. Review the run logs and individual job results to diagnose failures.
+
+---
 
 ## Project Structure
 
@@ -275,21 +483,63 @@ Axiom/
 └── README.md
 ```
 
-## Continuous Integration
+The tree illustrates the intended repository layout. Empty modules and evaluation assets are scaffolding until their associated functionality and validation are implemented.
 
-The GitHub Actions workflow is located at `.github/workflows/ci.yml`.
+---
 
-It is designed to validate the project on pushes and pull requests by:
+## Development Roadmap
 
-1. Starting PostgreSQL with pgvector and Redis service containers.
-2. Setting up Python 3.12.
-3. Installing development dependencies.
-4. Applying Alembic migrations against PostgreSQL.
-5. Running the automated test suite.
-6. Validating the Docker Compose configuration.
-7. Building the backend Docker image.
+Axiom will progress through incremental milestones with explicit acceptance criteria.
 
-The workflow should be considered verified only after a real GitHub Actions run completes successfully.
+| Phase | Milestone | Primary deliverables |
+|---|---|---|
+| 1 | Walking Skeleton | Application startup, infrastructure, migrations, health checks, tests, and CI |
+| 2 | Backend Foundations | Configuration, persistence, and workspace-scoped data access |
+| 3 | Authentication and Authorization | Secure identities and enforced workspace isolation |
+| 4 | Document Ingestion | Upload validation, background processing, and document lifecycle management |
+| 5 | PDF RAG MVP | PDF extraction, chunking, embeddings, retrieval, citations, and abstention |
+| 6 | Retrieval Evaluation | Baselines, vector-versus-hybrid comparisons, reranking experiments, and quality metrics |
+| 7 | Multimodal Retrieval | Evaluated extensions for additional document modalities |
+| 8 | Agentic Workflows | Controlled tool use, workflow orchestration, and human review where appropriate |
+
+Phase 6 will build on the PDF MVP rather than expanding the system before a measurable retrieval baseline exists. Its comparisons will be driven by evaluation results instead of assumptions that more complex retrieval is automatically better.
+
+---
+
+## Engineering Principles
+
+### Modular monolith first
+Maintain clear module boundaries without introducing microservices before there is a demonstrated need.
+
+### Security by design
+Enforce workspace authorization at the data-access layer and test for cross-workspace data leakage.
+
+### Grounded answers
+Require evidence-backed responses, traceable citations, and abstention when retrieved evidence is insufficient.
+
+### Evaluation over intuition
+Use versioned datasets, measurable retrieval metrics, and regression tests to assess changes in quality.
+
+### Operational reliability
+Use schema migrations, asynchronous processing, health checks, structured error handling, and automated validation.
+
+### Incremental delivery
+Complete and verify one milestone before adding complexity. Document important architectural decisions and their trade-offs.
+
+---
+
+## Current Limitations
+
+- Axiom is currently an infrastructure foundation, not a functioning RAG application.
+- Authentication and authorization have not yet been implemented.
+- Document upload, parsing, indexing, and answer generation are not available yet.
+- pgvector infrastructure does not, by itself, constitute an implemented retrieval pipeline.
+- The evaluation directory provides scaffolding; it does not establish retrieval or generation quality.
+- Docker and CI configuration must be verified through actual runtime and workflow executions.
+- Local credentials and development settings are not suitable for production.
+- Container privilege settings, worker execution permissions, secret handling, and other security controls require verification against the actual configuration before deployment.
+
+---
 
 ## Stopping the Environment
 
@@ -299,7 +549,7 @@ The workflow should be considered verified only after a real GitHub Actions run 
 docker compose down
 ```
 
-This removes the containers and network while preserving named volumes.
+This stops and removes the Compose containers and network while preserving named volumes.
 
 ### Stop containers and delete persistent data
 
@@ -307,50 +557,21 @@ This removes the containers and network while preserving named volumes.
 docker compose down -v
 ```
 
-**Warning:** This deletes the named volumes declared by the Compose project, including PostgreSQL and Redis data stored in those volumes. This operation is destructive and should be used only when a complete reset is intended.
+**Warning:** This removes the named volumes associated with the Compose project, including persistent PostgreSQL and Redis data stored in those volumes. Use it only when a complete local reset is intentional.
 
 | Command | Containers | Named volumes |
 |---|---|---|
 | `docker compose down` | Removed | Preserved |
 | `docker compose down -v` | Removed | Removed |
 
-## Current Limitations
-
-- The Walking Skeleton is infrastructure, not a complete RAG application.
-- Runtime checks must be performed with Docker Desktop running.
-- Database migrations must be tested against a real PostgreSQL instance.
-- Authentication and workspace authorization are not yet implemented.
-- Document ingestion, PDF parsing, retrieval, and answer generation are not yet implemented.
-- The evaluation directory provides a foundation for future retrieval and answer-quality testing; it does not by itself establish model or RAG quality.
-- Local-development credentials are disposable placeholders and must not be used in production.
-- The worker's non-root execution configuration and container security settings should be verified against the actual Dockerfile and Compose configuration.
-
-## Development Roadmap
-
-The planned development sequence is:
-
-1. **Walking Skeleton:** application startup, database schema, Redis, worker, health checks, tests, and CI.
-2. **Backend foundations:** configuration, persistence, and workspace-scoped data access.
-3. **Authentication and authorization:** secure identities and workspace isolation.
-4. **Document ingestion:** upload validation, background processing, and document lifecycle management.
-5. **PDF RAG MVP:** extraction, chunking, embeddings, retrieval, citations, and abstention.
-6. **Retrieval evaluation:** establish measurable baselines and compare vector search with hybrid retrieval and reranking.
-7. **Multimodal capabilities:** introduce additional modalities through explicit, evaluated extensions.
-8. **Agentic workflows:** add controlled tool use and human review where they provide measurable value.
-
-Each milestone should include tests, documented design decisions, and verifiable acceptance criteria before expanding the scope.
-
-## Engineering Principles
-
-Axiom is being developed with the following priorities:
-
-- **Modular monolith first:** clear internal boundaries without premature microservices.
-- **Data isolation:** enforce workspace boundaries in data access and retrieval.
-- **Grounded answers:** cite supporting document passages and abstain when evidence is insufficient.
-- **Measurable quality:** use evaluation datasets and regression tests rather than relying on subjective demos.
-- **Operational reliability:** use migrations, background jobs, health checks, CI, and structured error handling.
-- **Incremental delivery:** implement and verify one milestone before adding unnecessary complexity.
-
 ---
 
-**Axiom is currently establishing its engineering foundation.** The next goal is to turn this running skeleton into a secure, testable PDF RAG system before introducing multimodal retrieval and agentic workflows.
+## Project Direction
+
+Axiom is being developed as a practical exploration of the engineering required to build reliable enterprise AI systems.
+
+The immediate objective is to establish a verified backend foundation, then deliver a secure PDF-based RAG MVP with workspace isolation, evidence-backed citations, automated tests, and measurable retrieval quality.
+
+Multimodal retrieval and agentic workflows will follow only when the core system is reliable and their additional complexity can be justified through testing and evaluation.
+
+**The goal is not simply to make an LLM answer questions. It is to build an AI system whose behavior, evidence, and engineering decisions can be inspected and tested.**
