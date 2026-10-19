@@ -22,6 +22,7 @@ import getpass
 import os
 import sys
 
+from pydantic import EmailStr, TypeAdapter, ValidationError
 from sqlalchemy import func, select
 from sqlalchemy.exc import ProgrammingError
 
@@ -29,12 +30,34 @@ from app.auth.service import create_workspace, hash_password
 from app.db.models import User
 from app.db.session import SessionLocal
 
+# EmailStr is an annotation rather than a class, so it is validated
+# through a TypeAdapter.
+_EMAIL_ADAPTER = TypeAdapter(EmailStr)
+
 
 def _read_password() -> str:
     password = os.environ.get("BOOTSTRAP_PASSWORD")
     if password:
         return password
     return getpass.getpass("Password for the bootstrap administrator: ")
+
+
+def _validate_email(email: str) -> str:
+    """Check the address with the same rule the login endpoint uses.
+
+    Without this the command could create an account whose email the API
+    then refuses at login time (special-use domains such as .test or
+    .localhost are rejected), leaving an unusable administrator behind.
+    """
+    try:
+        return str(_EMAIL_ADAPTER.validate_python(email))
+    except ValidationError as exc:
+        raise ValueError(
+            "Not a usable email address: %r\n"
+            "Use an ordinary address such as admin@example.com. Addresses on "
+            "reserved domains (.test, .localhost, .invalid) are rejected by "
+            "the API at login time." % email
+        ) from exc
 
 
 def _parse_args(argv=None) -> argparse.Namespace:
@@ -67,6 +90,14 @@ def main(argv=None) -> int:
         print("Password must be at least 8 characters.")
         return 2
 
+    # Validated before the database is touched, so a bad address is
+    # reported plainly instead of as a bootstrap failure.
+    try:
+        email = _validate_email(args.email.strip().lower())
+    except ValueError as exc:
+        print(exc)
+        return 2
+
     session = SessionLocal()
     try:
         try:
@@ -88,14 +119,11 @@ def main(argv=None) -> int:
             )
             return 1
 
-        email = args.email.strip().lower()
         user = User(email=email, password_hash=hash_password(password))
         session.add(user)
         session.commit()
         session.refresh(user)
-
         workspace = create_workspace(session, args.workspace, user.id)
-
         print("Created administrator %s" % email)
         print("Created workspace %r (id=%s)" % (workspace.name, workspace.id))
         print("Sign in with POST /api/v1/auth/login")
