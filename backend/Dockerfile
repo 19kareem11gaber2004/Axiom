@@ -9,6 +9,14 @@ WORKDIR /srv/backend
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
+# The worker service runs as uid/gid 65532 (see docker-compose.yml).
+# The id has to exist in the image's user and group database, otherwise
+# the worker cannot resolve its own group: Celery then assumes it is
+# running as root and prints a "superuser privileges" warning that is
+# both alarming and false.
+RUN groupadd --gid 65532 nonroot \
+    && useradd --uid 65532 --gid 65532 --no-create-home --shell /usr/sbin/nologin nonroot
+
 COPY . .
 
 EXPOSE 8000

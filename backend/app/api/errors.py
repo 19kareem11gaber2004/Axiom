@@ -130,6 +130,26 @@ class RateLimitError(AxiomError):
         )
 
 
+class DependencyUnavailableError(AxiomError):
+    """A required dependency is unavailable, so the request was not carried out.
+
+    This is used when the login rate limiter cannot reach Redis and the
+    deployment is configured to fail closed. The request is refused with
+    503 rather than 429: the caller did nothing wrong, and a 429 would
+    wrongly suggest that it should back off and retry later.
+    """
+
+    def __init__(
+        self, message: str = "A required service is temporarily unavailable."
+    ) -> None:
+        super().__init__(
+            code="DEPENDENCY_UNAVAILABLE",
+            message=message,
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            retryable=True,
+        )
+
+
 class DocumentProcessingError(AxiomError):
     """Document could not be processed.
 

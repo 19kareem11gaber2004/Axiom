@@ -187,13 +187,15 @@ If the repository is already available locally, navigate to its root directory i
 
 ### 2. Configure environment variables
 
-Create your local environment file:
+The recommended workflow runs the API and the worker **inside Docker**, and Docker Compose supplies their configuration. No `.env` file is needed for that.
+
+Create a local environment file only if you intend to run the API on the host:
 
 ```powershell
 Copy-Item .env.example .env
 ```
 
-Review `.env` and confirm that the PostgreSQL and Redis connection strings match the service names, ports, and credentials configured in `docker-compose.yml`.
+`.env` is read from the repository root, no matter which directory the process is started from. Its `DATABASE_URL` and `REDIS_URL` point at `localhost`, which is the correct configuration for a process running **on the host** and the wrong one for a process running **in Docker** (inside the Compose network the services are reachable as `postgres:5432` and `redis:6379`).
 
 **Security notes:**
 
@@ -201,6 +203,8 @@ Review `.env` and confirm that the PostgreSQL and Redis connection strings match
 - Keep `.env.example` limited to safe placeholders.
 - Use a secrets manager or deployment-platform secrets for production credentials.
 - Do not reuse disposable development credentials in production.
+
+> **Do not mix the two workflows.** Running the API on the host while the containerised API is running gives two servers on port 8000. On Windows this does not produce a clear "address already in use" error - the socket layer allows both to bind - so requests are split between two processes that use different configuration. Pick one; see [Running the API on the host](#running-the-api-on-the-host-optional).
 
 ### 3. Start infrastructure services
 
@@ -224,6 +228,8 @@ docker compose logs redis
 ```
 
 ### 4. Install backend dependencies
+
+The backend package lives in `backend/`, so `app` is only importable from that directory. Commands that import `app` (uvicorn, alembic, the bootstrap command) must run with `backend/` as the working directory.
 
 Create and activate a virtual environment if you do not already have one:
 
@@ -260,6 +266,12 @@ This applies the migration history to the configured PostgreSQL database.
 
 A successful migration is required before the application can rely on the schema. If it fails, inspect the database connection settings, service health, extension availability, and migration logs.
 
+If the API runs in Docker, run the migration inside the Compose network instead, so it reaches the same database the API uses:
+
+```powershell
+docker compose run --rm api alembic upgrade head
+```
+
 ### 5a. Create the first administrator
 
 Axiom has **no public registration**. The only way a user account is created is an administrator adding it to a workspace, and the very first administrator has to be created by hand:
@@ -270,6 +282,12 @@ python -m app.auth.bootstrap --email admin@example.com --workspace "My Workspace
 Set-Location ..
 ```
 
+With the API running in Docker, run the command inside the Compose network so it uses the same database:
+
+```powershell
+docker compose run --rm api python -m app.auth.bootstrap --email admin@example.com --workspace "My Workspace"
+```
+
 The command prompts for the password (or reads it from `BOOTSTRAP_PASSWORD`). It refuses to run when the database already contains users, so it can never mint a second administrator unnoticed.
 
 Generate a strong signing key for anything other than local development:
@@ -278,7 +296,7 @@ Generate a strong signing key for anything other than local development:
 python -c "import secrets; print(secrets.token_urlsafe(48))"
 ```
 
-Put the result in `JWT_SECRET_KEY` in `.env`. The application **refuses to start** with the placeholder secret when `ENV` is not `dev`.
+Put the result in `JWT_SECRET_KEY` in `.env` (host workflow) or in `AXIOM_JWT_SECRET_KEY` for the Compose workflow. The application **refuses to start** with the placeholder secret when `ENV` is not `dev`.
 
 ### 6. Start the API and worker
 
@@ -294,6 +312,12 @@ To start them in the background instead:
 
 ```powershell
 docker compose up -d --build api worker
+```
+
+Or start the whole stack (PostgreSQL, Redis, API, worker) in one command:
+
+```powershell
+docker compose up -d --build
 ```
 
 The API is expected to be available at:
@@ -364,6 +388,91 @@ Invoke-RestMethod -Method Post -Uri http://localhost:8000/api/v1/workspaces `
 
 ---
 
+## Running the API on the host (optional)
+
+The Docker workflow above is the recommended one: the API and the worker then reach PostgreSQL and Redis over the Compose network, at `postgres:5432` and `redis:6379`.
+
+Running the API on the host is supported, but it needs two extra things.
+
+**1. Publish PostgreSQL and Redis to the host.** They are not published by default, which is deliberate: the default stack does not expose a database to the host (or the network). Use the override file:
+
+```powershell
+docker compose -f docker-compose.yml -f docker-compose.host-dev.yml up -d postgres redis
+```
+
+It binds both to `127.0.0.1`, so they are reachable from the host only.
+
+**2. Stop the containerised API.** Two servers on port 8000 is a silent problem on Windows:
+
+```powershell
+docker compose stop api
+```
+
+Then start the API from the `backend` directory (the `app` package is not importable from the repository root):
+
+```powershell
+Set-Location backend
+python -m uvicorn app.main:app --host 127.0.0.1 --port 8000
+```
+
+With `backend/` as the working directory, `.env` is still read from the repository root, so `DATABASE_URL` and `REDIS_URL` keep their `localhost` values.
+
+To go back to the containerised API:
+
+```powershell
+Set-Location ..
+docker compose up -d api
+```
+
+---
+
+## Recovering access to an account
+
+Axiom has no public registration and no "forgot password" flow, so an operator who loses the administrator password needs an explicit procedure. `python -m app.auth.password_reset` is it:
+
+```powershell
+docker compose run --rm api python -m app.auth.password_reset --email admin@example.com
+```
+
+(With the API on the host: `Set-Location backend` first, then `python -m app.auth.password_reset --email admin@example.com`.)
+
+For a non-interactive run, put the new password in `AXIOM_ADMIN_PASSWORD` and pass it through:
+
+```powershell
+$env:AXIOM_ADMIN_PASSWORD = Read-Host "New password"
+docker compose run --rm -e AXIOM_ADMIN_PASSWORD api python -m app.auth.password_reset --email admin@example.com
+Remove-Item Env:AXIOM_ADMIN_PASSWORD
+```
+
+The command:
+
+- only ever **updates an existing account**. It never creates a user and never grants a role, so it cannot mint an administrator behind an operator's back;
+- preserves the account: the id, the email, the creation timestamp and every workspace membership stay exactly as they were. Only the stored password hash is replaced;
+- reads the password from a prompt that does not echo it, or from the `AXIOM_ADMIN_PASSWORD` environment variable for non-interactive use. It never accepts the password on the command line by default, so it does not end up in shell history or in the process list;
+- never prints the password or a token.
+
+If the account does not exist, the command says so and changes nothing.
+
+---
+
+## Rate limiting and Redis outages
+
+Login attempts are rate limited per account and per source IP. The counters live in Redis, so the behaviour when Redis is unreachable is an explicit decision, not an accident:
+
+| `LOGIN_RATE_LIMIT_FAILURE_MODE` | Behaviour when Redis is unreachable |
+|---|---|
+| `open` (default) | The attempt is allowed through and the outage is logged once. The credential check still applies, so only this one defence-in-depth layer is weakened. |
+| `closed` | No login is attempted. The endpoint answers `503` with the error code `DEPENDENCY_UNAVAILABLE`. |
+
+The active mode is logged at startup and can be set per environment:
+
+- host workflow: `LOGIN_RATE_LIMIT_FAILURE_MODE` in `.env`
+- Compose workflow: `AXIOM_LOGIN_RATE_LIMIT_FAILURE_MODE` (defaults to `open`)
+
+The `/ready` endpoint reports Redis as `down` while it is unreachable, so a load balancer stops routing traffic to an API whose limiter is not working.
+
+---
+
 ## Running Tests
 
 Run tests from the repository root unless a command explicitly changes directories.
@@ -380,8 +489,8 @@ The suite contains 153 tests. Tests that need PostgreSQL or Redis are **skipped*
 
 ```powershell
 Set-Location backend
-$env:DATABASE_URL = "postgresql+psycopg://axiom:axiom@localhost:5432/axiom"
-$env:REDIS_URL = "redis://localhost:6379/0"
+$env:DATABASE_URL = "postgresql+psycopg://axiom:axiom@127.0.0.1:5432/axiom"
+$env:REDIS_URL = "redis://127.0.0.1:6379/0"
 python -m pytest -q
 Set-Location ..
 ```
@@ -405,6 +514,25 @@ The integration test is intended to verify:
 - The existence of the nine expected application tables
 
 The test must use the correct environment configuration and a successfully migrated database.
+
+### Running the whole suite against the Compose services
+
+The default stack does not publish PostgreSQL or Redis to the host, so a host-side test run cannot reach them and the database-backed tests are skipped. Run the suite inside the Compose network instead, where the same `postgres:5432` and `redis:6379` addresses are used:
+
+```powershell
+docker compose run --rm api sh -c "pip install --no-cache-dir -r requirements-dev.txt && python -m pytest -q"
+```
+
+The image installs only the runtime dependencies, so the development requirements (pytest, httpx) are installed for this one-off run.
+
+To run the suite on the host instead, publish the database ports first:
+
+```powershell
+docker compose -f docker-compose.yml -f docker-compose.host-dev.yml up -d postgres redis
+Set-Location backend
+python -m pytest -q
+Set-Location ..
+```
 
 ---
 
@@ -515,6 +643,7 @@ Axiom/
 │   │   ├── auth/
 │   │   │   ├── bootstrap.py
 │   │   │   ├── dependencies.py
+│   │   │   ├── password_reset.py
 │   │   │   ├── rate_limit.py
 │   │   │   └── service.py
 │   │   ├── db/
@@ -526,7 +655,8 @@ Axiom/
 │   │   ├── storage/
 │   │   │   └── uploads.py
 │   │   ├── worker/
-│   │   │   └── celery_app.py
+│   │   │   ├── celery_app.py
+│   │   │   └── tasks.py
 │   │   ├── api/
 │   │   │   ├── errors.py
 │   │   │   ├── schemas.py
@@ -538,16 +668,23 @@ Axiom/
 │   │   └── main.py
 │   ├── tests/
 │   │   ├── conftest.py
+│   │   ├── test_auth_api.py
 │   │   ├── test_auth_dependencies.py
 │   │   ├── test_auth_service.py
+│   │   ├── test_bootstrap.py
+│   │   ├── test_config.py
 │   │   ├── test_cors.py
+│   │   ├── test_db_session.py
 │   │   ├── test_documents.py
 │   │   ├── test_errors.py
 │   │   ├── test_health.py
+│   │   ├── test_lifespan.py
 │   │   ├── test_migration_sql.py
 │   │   ├── test_rate_limit.py
+│   │   ├── test_readiness.py
 │   │   ├── test_ready.py
 │   │   ├── test_smoke_integration.py
+│   │   ├── test_worker.py
 │   │   └── test_workspaces.py
 │   ├── Dockerfile
 │   ├── alembic.ini
@@ -564,6 +701,7 @@ Axiom/
 ├── .env.example
 ├── .gitignore
 ├── docker-compose.yml
+├── docker-compose.host-dev.yml
 └── README.md
 ```
 
@@ -617,7 +755,7 @@ Complete and verify one milestone before adding complexity. Document important a
 - Axiom is currently a secure API foundation, not a functioning RAG application. No answer is generated yet.
 - **No background processing.** Uploads are validated, stored, and queued, but no Celery task consumes the queue: documents stay in `queued` until the worker lands in Phase 4.
 - **Access tokens are stateless.** `POST /auth/logout` cannot revoke a token on the server; the client discards it. There is no token blocklist and no refresh token. Workspace and role are re-read from the database on every request, so a revoked membership or a demotion takes effect immediately.
-- **The login rate limiter fails open.** If Redis is unreachable the limiter is bypassed and a warning is logged, because failing closed would turn a Redis outage into a total login outage. The credential check still applies.
+- **The login rate limiter fails open by default.** If Redis is unreachable the limiter is bypassed and a warning is logged, because failing closed would turn a Redis outage into a total login outage. The credential check still applies. The posture is configurable (`LOGIN_RATE_LIMIT_FAILURE_MODE=closed` refuses logins with 503 while the limiter is unreachable) and is logged at startup.
 - **`X-Forwarded-For` is not trusted.** The per-IP login limit sees the proxy address behind a reverse proxy. Honouring the header is a deployment concern, because a client could otherwise spoof it to escape the limit.
 - **The document file store is local.** Files live under `backend/storage/` and are removed with the document. The `FileStorage` abstraction that allows an object store arrives in Phase 3.
 - **Only PDF uploads are accepted**, and only a plain `%PDF-` signature is checked. Page count, character count, and processing-time limits arrive with the worker.

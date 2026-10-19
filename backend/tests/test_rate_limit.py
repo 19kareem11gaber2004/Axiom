@@ -123,6 +123,148 @@ def test_rate_limiting_fails_open_when_redis_is_down(monkeypatch, clean_counters
     rate_limit.reset("email", "someone@example.com")
 
 
+# ---------------------------------------------------------------------------
+# The failure mode is explicit and configurable
+# ---------------------------------------------------------------------------
+
+def test_the_default_mode_fails_open(monkeypatch, clean_counters):
+    """The decision says the limiter was not consulted, and allows the login."""
+    monkeypatch.setattr(rate_limit, "get_client", lambda: None)
+    decision = rate_limit.check_login_allowed("someone@example.com", "203.0.113.9")
+    assert decision.allowed is True
+    assert decision.limiter_available is False
+    assert decision.retry_after == 0
+
+
+def test_the_closed_mode_refuses_the_login(monkeypatch, clean_counters):
+    """A deployment that requires the limiter gets no login at all."""
+    monkeypatch.setattr(rate_limit, "get_client", lambda: None)
+    monkeypatch.setattr(
+        rate_limit.settings, "login_rate_limit_failure_mode", "closed"
+    )
+    decision = rate_limit.check_login_allowed("someone@example.com", "203.0.113.9")
+    assert decision.allowed is False
+    assert decision.limiter_available is False
+
+
+def test_the_closed_mode_answers_503_and_not_429(
+    monkeypatch, clean_counters, db_session
+):
+    """503 says "the server cannot do this", 429 would blame the caller."""
+    from fastapi.testclient import TestClient
+
+    from app.main import app
+
+    monkeypatch.setattr(rate_limit, "get_client", lambda: None)
+    monkeypatch.setattr(
+        rate_limit.settings, "login_rate_limit_failure_mode", "closed"
+    )
+
+    client = TestClient(app, raise_server_exceptions=False)
+    r = client.post(
+        "/api/v1/auth/login",
+        json={"email": "closed@example.com", "password": "whatever-1234"},
+    )
+
+    assert r.status_code == 503
+    assert r.json()["error"]["code"] == "DEPENDENCY_UNAVAILABLE"
+    assert r.json()["error"]["retryable"] is True
+
+
+def test_the_open_mode_still_answers_the_normal_401(
+    monkeypatch, clean_counters, db_session
+):
+    """With the limiter down but the mode open, the credentials decide."""
+    from fastapi.testclient import TestClient
+
+    from app.main import app
+
+    monkeypatch.setattr(rate_limit, "get_client", lambda: None)
+
+    client = TestClient(app, raise_server_exceptions=False)
+    r = client.post(
+        "/api/v1/auth/login",
+        json={"email": "open@example.com", "password": "whatever-1234"},
+    )
+
+    assert r.status_code == 401
+    assert r.json()["error"]["code"] == "UNAUTHENTICATED"
+
+
+def test_a_redis_failure_during_a_call_is_reported_like_a_connection_failure(
+    monkeypatch, clean_counters, caplog
+):
+    """Redis can die while the limiter is in use.
+
+    The counters must not silently read as zero: the outage has to be
+    reported once, exactly like a failure to connect.
+    """
+    class BrokenClient:
+        def get(self, key):
+            raise RuntimeError("redis went away")
+
+        def ttl(self, key):
+            raise RuntimeError("redis went away")
+
+    monkeypatch.setattr(rate_limit, "get_client", lambda: BrokenClient())
+
+    with caplog.at_level("WARNING", logger="axiom.ratelimit"):
+        blocked, retry_after = rate_limit.is_blocked("email", "someone@example.com", 5)
+
+    assert blocked is False
+    assert retry_after == 0
+    warnings = [r for r in caplog.records if r.levelname == "WARNING"]
+    assert any("not being limited" in r.message for r in warnings)
+
+
+def test_closing_the_client_releases_it(clean_counters):
+    """Shutdown must not leave a Redis connection behind."""
+    class FakeClient:
+        def __init__(self):
+            self.closed = False
+
+        def close(self):
+            self.closed = True
+
+    fake = FakeClient()
+    rate_limit._client = fake
+    rate_limit.close_client()
+    assert fake.closed is True
+    assert rate_limit._client is None
+
+
+def test_a_failure_during_the_check_counts_as_unavailable(monkeypatch, clean_counters):
+    """A counter that cannot be read is unknown, not zero."""
+    class BrokenClient:
+        def get(self, key):
+            raise RuntimeError("redis went away")
+
+    monkeypatch.setattr(rate_limit, "get_client", lambda: BrokenClient())
+
+    decision = rate_limit.check_login_allowed("someone@example.com", "203.0.113.9")
+
+    assert decision.limiter_available is False
+    assert decision.allowed is True  # the default mode fails open
+
+
+def test_a_failure_during_the_check_refuses_the_login_when_closed(
+    monkeypatch, clean_counters
+):
+    class BrokenClient:
+        def get(self, key):
+            raise RuntimeError("redis went away")
+
+    monkeypatch.setattr(rate_limit, "get_client", lambda: BrokenClient())
+    monkeypatch.setattr(
+        rate_limit.settings, "login_rate_limit_failure_mode", "closed"
+    )
+
+    decision = rate_limit.check_login_allowed("someone@example.com", "203.0.113.9")
+
+    assert decision.limiter_available is False
+    assert decision.allowed is False
+
+
 def test_a_down_redis_is_not_reconnected_on_every_call(monkeypatch, clean_counters):
     """A burst of requests must not each pay the connection timeout.
 

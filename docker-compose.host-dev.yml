@@ -1,0 +1,41 @@
+# Override file for the optional host-based development workflow.
+#
+# Use it only when the API is started on the host (Windows) instead of
+# in the container:
+#
+#   docker compose -f docker-compose.yml -f docker-compose.host-dev.yml up -d postgres redis
+#
+# It publishes PostgreSQL and Redis on the host loopback interface, so a
+# uvicorn process on Windows can reach them:
+#
+#   DATABASE_URL=postgresql+psycopg://axiom:axiom@localhost:5432/axiom
+#   REDIS_URL=redis://localhost:6379/0
+#
+# Those are exactly the values in .env.example, and they are the ones the
+# application reads when it runs on the host.
+#
+# It does NOT change the api or the worker service: they keep talking to
+# postgres:5432 and redis:6379 over the Compose network, which is the
+# configuration they are built for.
+#
+# Before starting the API on the host, stop the containerised one so the
+# two do not compete for port 8000:
+#
+#   docker compose stop api
+#
+# The published ports are bound to 127.0.0.1, so they are reachable from
+# the host only.
+
+services:
+  postgres:
+    ports:
+      # Bound to the IPv4 loopback only. The *client* must therefore
+      # use 127.0.0.1 and not "localhost": on Windows "localhost"
+      # resolves to ::1 first, and a port published on IPv4 only leaves
+      # that first attempt hanging until the connect timeout instead of
+      # being refused - the exact "Timeout connecting to server" trap.
+      - "127.0.0.1:5432:5432"
+
+  redis:
+    ports:
+      - "127.0.0.1:6379:6379"

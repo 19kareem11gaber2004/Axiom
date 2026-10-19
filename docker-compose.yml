@@ -1,14 +1,52 @@
+# Axiom - local development stack.
+#
+# The API and the Celery worker run INSIDE this network on purpose. They
+# reach PostgreSQL as "postgres:5432" and Redis as "redis:6379", and
+# those names only resolve on the Compose network. Starting uvicorn on
+# the Windows host with these values fails: the host has no PostgreSQL
+# on port 5432 and no Redis on port 6379, because neither is published
+# here.
+#
+# The recommended workflow is therefore:
+#
+#   docker compose up -d --build
+#
+# and nothing else. Do not also start uvicorn on the host: on Windows
+# the socket layer allows two processes to bind port 8000 at the same
+# time (SO_REUSEADDR), so the requests are split between two servers
+# that use different configuration. Stop the api service first
+# (docker compose stop api) if you really want to run the API on the
+# host, and see docker-compose.host-dev.yml for the matching port
+# mappings.
+#
+# The values below are overridable from the shell or from a .env file in
+# this directory. They deliberately use AXIOM_ prefixed names: Docker
+# Compose also reads the application's .env file for interpolation, and
+# that file contains "localhost" URLs for the host-based workflow.
+# Reusing the bare names here would silently point the containers at the
+# host's own ports.
+#
+# The credentials below are disposable local-development values that
+# match .env.example. They are not secrets.
+
+x-app-environment: &app-environment
+  DATABASE_URL: ${AXIOM_DATABASE_URL:-postgresql+psycopg://axiom:axiom@postgres:5432/axiom}
+  REDIS_URL: ${AXIOM_REDIS_URL:-redis://redis:6379/0}
+  ENV: ${AXIOM_ENV:-dev}
+  JWT_SECRET_KEY: ${AXIOM_JWT_SECRET_KEY:-dev-only-insecure-jwt-secret-change-me}
+  LOGIN_RATE_LIMIT_FAILURE_MODE: ${AXIOM_LOGIN_RATE_LIMIT_FAILURE_MODE:-open}
+
 services:
   postgres:
     image: pgvector/pgvector:pg16
     environment:
-      POSTGRES_USER: axiom
-      POSTGRES_PASSWORD: axiom
-      POSTGRES_DB: axiom
+      POSTGRES_USER: ${AXIOM_DB_USER:-axiom}
+      POSTGRES_PASSWORD: ${AXIOM_DB_PASSWORD:-axiom}
+      POSTGRES_DB: ${AXIOM_DB_NAME:-axiom}
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U axiom -d axiom"]
+      test: ["CMD-SHELL", "pg_isready -U ${AXIOM_DB_USER:-axiom} -d ${AXIOM_DB_NAME:-axiom}"]
       interval: 5s
       timeout: 3s
       retries: 10
@@ -26,29 +64,41 @@ services:
 
   api:
     build: ./backend
-    environment:
-      DATABASE_URL: postgresql+psycopg://axiom:axiom@postgres:5432/axiom
-      REDIS_URL: redis://redis:6379/0
+    environment: *app-environment
     ports:
-      - "8000:8000"
+      # Bound to the loopback interface: the API is a development server
+      # and must not be reachable from the local network.
+      - "127.0.0.1:8000:8000"
     depends_on:
       postgres:
         condition: service_healthy
       redis:
         condition: service_healthy
+    healthcheck:
+      test:
+        - "CMD"
+        - "python"
+        - "-c"
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3)"
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: unless-stopped
 
   worker:
     build: ./backend
-    environment:
-      DATABASE_URL: postgresql+psycopg://axiom:axiom@postgres:5432/axiom
-      REDIS_URL: redis://redis:6379/0
+    environment: *app-environment
     command: ["celery", "-A", "app.worker.celery_app", "worker", "--loglevel=info"]
     depends_on:
       postgres:
         condition: service_healthy
       redis:
         condition: service_healthy
+    # Give a running task time to finish before the container is killed.
+    stop_grace_period: 30s
     user: "65532:65532"
+    restart: unless-stopped
 
 volumes:
   pgdata:

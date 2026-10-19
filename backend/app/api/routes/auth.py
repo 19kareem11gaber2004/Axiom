@@ -5,7 +5,11 @@ from typing import Optional
 from fastapi import APIRouter, Depends, Request, Response, status
 from sqlalchemy.orm import Session
 
-from app.api.errors import AuthenticationError, RateLimitError
+from app.api.errors import (
+    AuthenticationError,
+    DependencyUnavailableError,
+    RateLimitError,
+)
 from app.api.schemas import (
     CurrentUserRead,
     MembershipRead,
@@ -50,14 +54,28 @@ def login(payload: TokenRequest, request: Request, db: Session = Depends(get_db)
 
     Repeated failures are rate limited per account and per source IP; the
     limit is cleared by a successful login.
+
+    When the limiter cannot reach Redis the configured failure mode
+    decides what happens (see app/auth/rate_limit.py): the default
+    "open" mode lets the attempt through, because the credential check
+    below still applies; the "closed" mode answers 503 and performs no
+    login at all.
     """
     ip_address = _client_ip(request)
 
-    allowed, retry_after = check_login_allowed(payload.email, ip_address)
-    if not allowed:
+    decision = check_login_allowed(payload.email, ip_address)
+    if not decision.allowed:
+        if not decision.limiter_available:
+            # The limiter is down and the deployment fails closed. This
+            # is a server-side problem, not a caller problem, so it is
+            # reported as 503 and not as 429.
+            raise DependencyUnavailableError(
+                "Login is temporarily unavailable because the rate limiter "
+                "cannot be reached."
+            )
         raise RateLimitError(
             "Too many failed login attempts. Try again in %d seconds."
-            % retry_after
+            % decision.retry_after
         )
 
     user = authenticate_user(db, payload.email, payload.password)

@@ -2,7 +2,7 @@
 
 > **Who this is for.** You have the project and you want to *understand* it, not just run it. This document explains what Phase 2 built, why each piece exists, and how to read the code.
 >
-> **How to use it.** Read §1–§3 first (the story). Then read the code in the order given in §11. Every section names the exact file and function so you can follow along in your editor.
+> **How to use it.** Read §1–§3 first (the story). Then read the code in the order given in §11. Every section names the exact file and function so you can follow along in your editor. When you want to *prove* that you understand it, work through the six exercises in §14.
 >
 > The operational README stays in `README.md` (how to install and run). This one is about *why*.
 
@@ -40,7 +40,9 @@ Those two problems — **who may see what**, and **what is actually true right n
 | Plain `{"detail": ...}` errors | one envelope for every failure: `{"error": {code, message, retryable, request_id}}` |
 | Any client could call the API | CORS restricted to configured browser origins |
 | Unlimited login attempts | Redis-backed rate limiting, per account and per IP |
-| 0 application tests | 159 tests against a real PostgreSQL and a real Redis |
+| A worker container that exited with `ModuleNotFoundError` | a worker that connects to the broker and waits for work |
+| Requests that could hang for minutes on an unreachable database | every connection attempt and every pool wait is bounded |
+| 0 application tests | 226 tests against a real PostgreSQL and a real Redis |
 
 ---
 
@@ -79,6 +81,8 @@ Client:  POST /api/v1/auth/login
     ├─ rate limit check         app/auth/rate_limit.py
     │  Is this account (or this IP) over the failure limit?
     │  Over → 429, and we never run the expensive password check.
+    │  Redis unreachable → the configured failure mode decides:
+    │  "open" (default) allows the attempt, "closed" answers 503.
     │
     ├─ authenticate_user()      app/auth/service.py
     │  Look up the user, then bcrypt-verify the password.
@@ -123,7 +127,7 @@ Client:  GET /api/v1/auth/me
 
 ---
 
-## 5. The seven pieces, one at a time
+## 5. The ten pieces, one at a time
 
 ### 5.1 `app/config.py` — configuration
 
@@ -139,6 +143,25 @@ if self.env.lower() != "dev" and self.jwt_secret_key == DEV_JWT_SECRET:
 ```
 
 Failing fast is much better than silently running with a guessable key.
+
+**Why the `.env` path is absolute.** Look at `model_config`:
+
+```python
+"env_file": (str(ROOT_ENV_FILE), ".env"),   # repository root first, CWD second
+```
+
+A relative `env_file` is resolved against the **current working directory**, and that is a trap: the `.env` file lives in the repository root, but `app` only imports from `backend/` (running uvicorn from the repository root fails with `No module named 'app'`). So a process started from `backend/` silently ignored the root `.env` and fell back to the built-in defaults — `localhost:5432` and `localhost:6379`, which the Docker stack does not publish. The result was an API that started, served `/docs`, and could reach neither PostgreSQL nor Redis. Resolving the path from `__file__` makes the configuration independent of where the process was started.
+
+**The settings that keep a dependency outage bounded:**
+
+| Setting | Default | What it bounds |
+|---|---|---|
+| `DB_CONNECT_TIMEOUT_SECONDS` | 10 | One TCP connection attempt to PostgreSQL |
+| `DB_POOL_TIMEOUT_SECONDS` | 30 | The wait for a free pooled connection |
+| `DB_POOL_RECYCLE_SECONDS` | 1800 | How long an idle pooled connection is reused |
+| `LOGIN_RATE_LIMIT_FAILURE_MODE` | `open` | What the login endpoint does when Redis is unreachable |
+
+The failure mode is validated: a typo (`half-open`) is **rejected at start-up**, because "fail open" and "fail closed" are opposite security decisions and nobody should get one by accident.
 
 ---
 
@@ -177,6 +200,8 @@ Why it matters in practice:
 - `request_id` lets a user quote one string that a human can grep in the server logs.
 - **No stack trace ever reaches the client.** The catch-all handler logs the full exception server-side and returns a generic message.
 
+**Two codes that are easy to confuse.** `RATE_LIMITED` (429) means *you* did something the server will not accept yet — you failed too many logins, slow down. `DEPENDENCY_UNAVAILABLE` (503) means *the server* cannot do this right now — the rate limiter cannot reach Redis and the deployment is configured to fail closed. A server-side outage must never be reported as 429: that tells the caller to back off and retry, which will not help, and it hides a real outage behind a client error.
+
 **Read this if you want one important detail:** `ErrorBoundaryMiddleware` exists because of a *subtle* Starlette behaviour. Starlette attaches a plain `@app.exception_handler(Exception)` to `ServerErrorMiddleware`, which sits **outside** the user middleware stack. A 500 produced there gets no CORS headers, so the browser reports a CORS error instead of a server error — a genuinely confusing trap. The boundary middleware is registered *inside* CORS so the 500 passes through the CORS layer normally. The middleware order is `request_id → CORS → error boundary → router`, and there is a test that asserts this ordering.
 
 ---
@@ -203,6 +228,8 @@ The server signs it with `JWT_SECRET_KEY`. The server can therefore check "did I
 - An expired token raises a distinct error so the client can say "session expired, log in again".
 
 **One more detail:** `authenticate_user` returns `None` for both "no such account" and "wrong password", and it spends comparable CPU on a dummy hash when the account does not exist. Otherwise an attacker could measure response time to discover which emails are registered.
+
+**A password can only be changed by one command.** `add_workspace_member` creates an account if the email is unknown and **never** overwrites the password of an account that already exists — overwriting would be an account-takeover vector. The only path that replaces a stored hash is `app/auth/password_reset.py`, an explicit administrative command (§5.9). That is worth knowing when a login returns 401: the credential check is honest, so a 401 means the supplied password does not match the stored hash, not that the account is missing or the database is unreachable.
 
 ---
 
@@ -257,6 +284,8 @@ def delete_document(
 
 **`app/auth/bootstrap.py`** creates the very first administrator, because there is no public registration: adding members requires an admin, and initially there is none. It refuses to run when the database already has users, so it can never mint a second administrator unnoticed.
 
+**`app/auth/password_reset.py`** is the way back in when an operator loses the administrator password. It updates the hash of an **existing** account and nothing else: the id, the email, the creation timestamp and every workspace membership survive; it never creates an account and never grants a role; it reads the password from a prompt that does not echo it (or from `AXIOM_ADMIN_PASSWORD` for non-interactive use) and never prints it.
+
 ---
 
 ### 5.7 `app/auth/rate_limit.py` — brute-force protection
@@ -274,13 +303,74 @@ def delete_document(
 
 **The window is fixed.** The TTL starts at the first failure and is not extended by later ones, so the maximum attempts in any window is bounded.
 
-**It fails open.** If Redis is unreachable, the limiter is bypassed and a warning is logged. The alternative — failing closed — would turn a Redis outage into a total login outage, which is a self-inflicted denial of service. The password check still applies either way; failing open only weakens one layer of defence.
+**It fails open *by default*, and that is a decision, not an accident.** If Redis is unreachable, the limiter is bypassed and the outage is logged. The alternative — failing closed — would turn a Redis outage into a total login outage, which is a self-inflicted denial of service. The password check still applies either way; failing open only weakens one layer of defence.
+
+**The posture is explicit and configurable.** `LOGIN_RATE_LIMIT_FAILURE_MODE` selects it, the value is logged at start-up, and an unknown value is rejected rather than silently defaulted:
+
+| Mode | Redis unreachable | Why you would choose it |
+|---|---|---|
+| `open` (default) | The attempt is allowed through; the outage is logged once | A Redis outage must not become a login outage |
+| `closed` | No login is attempted; the endpoint answers `503 DEPENDENCY_UNAVAILABLE` | Brute-force protection is a hard requirement of the deployment |
+
+The limiter reports three things, not two. `LoginDecision` carries `allowed`, `retry_after` **and** `limiter_available`, so the endpoint can tell "you are blocked" (429) from "the limiter is down" (503) instead of guessing.
+
+**An outage that starts *during* a request is an outage too.** A counter that cannot be read is *unknown*, not zero. If Redis dies between the connection and the `GET`, the limiter drops the client, applies the reconnect back-off and reports the outage — exactly as it does for a connection that never succeeded. Silently treating a failed read as "0 failures" would quietly disable the limiter for everybody, and nothing in the log would say so.
 
 **`X-Forwarded-For` is deliberately ignored.** A client could spoof that header to escape the per-IP limit. Honouring it is a deployment concern, handled by the reverse proxy, not by the application.
 
 ---
 
-### 5.8 CORS — the browser-only rule
+### 5.8 `app/db/session.py` — surviving an unreachable database
+
+**What it does.** Owns the connection pool and the session factory.
+
+**The concept: every wait must be bounded.** Three timeouts, all configurable:
+
+```python
+engine = create_engine(
+    settings.database_url,
+    pool_pre_ping=True,                                  # a closed connection is replaced, not reused
+    pool_timeout=settings.db_pool_timeout_seconds,       # how long to wait for a free connection
+    pool_recycle=settings.db_pool_recycle_seconds,       # how long an idle connection is trusted
+    connect_args={"connect_timeout": ...},               # how long one TCP connection attempt may take
+)
+```
+
+Without `connect_timeout`, an unreachable database does not fail — it *hangs*, until the operating system gives up, which on some networks is minutes. A request that hangs forever is far worse than a request that fails in ten seconds, because the caller cannot tell the difference between "slow" and "gone".
+
+**The concept: a session is not thread-safe, and shutdown is where that bites.** FastAPI runs a synchronous route handler in a worker thread, and it tears the same request's dependencies down in *another* thread. When a request is cancelled — the client disconnects, or the server is stopped with Ctrl+C — the teardown can reach `Session.close()` while the handler is still blocked inside `_connection_for_bind()`, waiting for a connection. SQLAlchemy refuses that close:
+
+```
+sqlalchemy.exc.IllegalStateChangeError: Method 'close()' can't be called here;
+method '_connection_for_bind()' is already in progress
+```
+
+and the SQLAlchemy error replaces the real one (`asyncio.CancelledError`), so the log shows a confusing internal error instead of "the request was cancelled while it was waiting for the database".
+
+`close_session()` handles exactly that case, and only that case: it catches `IllegalStateChangeError`, logs it, and returns. The original `CancelledError` propagates, which is the truth. The fix is deliberately narrow — a broad `except Exception` around the teardown would hide real bugs, and masking a race is not the same as fixing it.
+
+**The concept: the application owns its connections.** The lifespan handler disposes the engine and closes the cached Redis client on shutdown, so a stopped process does not keep sockets open.
+
+---
+
+### 5.9 `app/main.py` — the lifespan, and knowing what you are running
+
+**What it does.** Registers the middlewares and the routers, serves `/health` and `/ready`, and owns the startup/shutdown hooks.
+
+**The concept: the process should say what it is connected to.** The lifespan handler logs the effective configuration at start-up — the environment, the database host, the Redis host, the rate-limit posture — **without any secret**:
+
+```
+2026-10-19 22:39:51 INFO axiom.main: Starting Axiom API in the dev environment.
+PostgreSQL=postgres:5432/axiom Redis=redis:6379 rate-limit-failure-mode=open
+```
+
+That one line answers the question that costs the most time to answer by hand: *which database is this process actually talking to?* It is the difference between "the API is broken" and "this API is configured for a different environment".
+
+**The concept: `/health` and `/ready` answer different questions.** `/health` says the process is alive. `/ready` performs bounded connectivity checks against PostgreSQL and Redis and answers `503` when a dependency is down. A load balancer should use `/ready`; a supervisor should use `/health`. Mixing them up means either restarting a perfectly healthy process or routing traffic to a process that cannot serve.
+
+---
+
+### 5.10 CORS — the browser-only rule
 
 **What it does.** Decides whether *browser JavaScript* may read a response.
 
@@ -315,6 +405,10 @@ The server must answer with `Access-Control-Allow-Origin` **and** list `x-worksp
 | Using a token after the account is deleted | The user row is re-read on every request | `get_current_user` |
 | A demoted admin keeping admin rights | Role re-read per request, not baked into the token | `get_current_membership` |
 | Brute force | Redis rate limit, per account and per IP | `app/auth/rate_limit.py` |
+| The limiter silently stops working | The outage is reported and the posture is explicit | `app/auth/rate_limit.py`, `LOGIN_RATE_LIMIT_FAILURE_MODE` |
+| A request hanging forever on a dead dependency | Every connection attempt and pool wait is bounded | `app/db/session.py` |
+| A cancelled request reported as an internal error | The teardown tolerates exactly one race and lets the real error through | `close_session` |
+| Two API servers sharing port 8000 | The API is published on `127.0.0.1` and the rule is documented | `docker-compose.yml`, `docker-compose.host-dev.yml` |
 | Passwords stolen from a database dump | bcrypt hashes, never plaintext | `hash_password` |
 | Finding which emails exist | Identical response and timing for unknown email and wrong password | `authenticate_user` |
 | Path traversal via a filename | Filename never builds a path; storage key is `{document_id}` | `app/storage/uploads.py` |
@@ -352,22 +446,19 @@ Copy-Item .env.example .env
 docker compose up -d postgres redis
 docker compose ps          # wait for "healthy"
 
-# 3. Dependencies
+# 3. Dependencies (only needed for a host-side run or for the tests)
 cd backend
 py -3.12 -m venv .venv
 .\.venv\Scripts\Activate.ps1
 python -m pip install -r requirements-dev.txt
 cd ..
 
-# 4. Schema
-cd backend
-python -m alembic upgrade head
-cd ..
+# 4. Schema - inside the Compose network, so it uses the same database
+#    as the API
+docker compose run --rm api alembic upgrade head
 
 # 5. First administrator
-cd backend
-python -m app.auth.bootstrap --email admin@example.com --workspace "My Workspace"
-cd ..
+docker compose run --rm api python -m app.auth.bootstrap --email admin@example.com --workspace "My Workspace"
 
 # 6. Run
 docker compose up --build api worker
@@ -375,19 +466,67 @@ docker compose up --build api worker
 
 **Where things are:** API on `http://localhost:8000`, interactive docs on `http://localhost:8000/docs`, files under `backend/storage/`.
 
+**Where the API runs matters.** The API and the worker are meant to run *inside* the Compose network, where PostgreSQL is `postgres:5432` and Redis is `redis:6379`. Those names do not resolve on the Windows host, and the default stack does not publish those ports, so a uvicorn process started on the host would find neither database nor Redis.
+
+**One API process. Never two.** This is the trap that costs the most time on Windows. `asyncio` sets `SO_REUSEADDR` on its listening socket, and on Windows that flag lets a second process bind a port that is already in use. So a host uvicorn can "successfully start on port 8000" while the container is publishing the same port — no "address already in use", no warning. From then on, requests are split between two servers with **different configuration**: the container talks to `postgres:5432` and works, the host process talks to `localhost:5432` and times out. The symptom is maddening because it looks random.
+
+The rule is simple: pick one. If you want the API on the host, stop the containerised one first.
+
+```powershell
+# publish PostgreSQL and Redis for a host-side process
+docker compose -f docker-compose.yml -f docker-compose.host-dev.yml up -d postgres redis
+
+# stop the containerised API: two servers on port 8000 is a silent
+# mess on Windows, because the socket layer lets both bind
+docker compose stop api
+
+cd backend
+python -m uvicorn app.main:app --host 127.0.0.1 --port 8000
+```
+
+Two details worth checking, because they are how the trap is detected:
+
+```powershell
+# who is actually holding port 8000?
+Get-NetTCPConnection -State Listen | Where-Object LocalPort -eq 8000
+
+# is the API exposed to the local network? it should be 127.0.0.1 only
+docker compose ps
+```
+
+The Compose file publishes the API as `127.0.0.1:8000:8000` for exactly this reason: a development server should not be reachable from the LAN.
+
+The `app` package only imports from the `backend` directory, which is why
+`python -m uvicorn app.main:app` fails with `No module named 'app'` when it
+is run from the repository root. The `.env` file is read from the repository
+root either way.
+
+**Lost the administrator password?** There is no "forgot password" flow, by
+design. Use the explicit administrative procedure, which updates the hash of
+an existing account and preserves the account itself:
+
+```powershell
+docker compose run --rm api python -m app.auth.password_reset --email admin@example.com
+```
+
+It never creates an account, never grants a role, never prints the password,
+and refuses to do anything for an address that does not exist.
+
 ---
 
 ## 9. Verifying it
 
 ```powershell
+# The full suite, against the real infrastructure, inside the Compose
+# network (the default stack does not publish PostgreSQL or Redis to
+# the host, so a host-side run cannot reach them)
+docker compose run --rm api sh -c "pip install --no-cache-dir -r requirements-dev.txt && python -m pytest -q"
+
+# ...or on the host, after publishing the ports
+docker compose -f docker-compose.yml -f docker-compose.host-dev.yml up -d postgres redis
 cd backend
-
-# The full suite (159 tests)
-python -m pytest -q
-
-# Point it at real infrastructure so the DB/Redis tests actually run
-$env:DATABASE_URL = "postgresql+psycopg://axiom:axiom@localhost:5432/axiom"
-$env:REDIS_URL   = "redis://localhost:6379/0"
+$env:DATABASE_URL = "postgresql+psycopg://axiom:axiom@127.0.0.1:5432/axiom"
+$env:REDIS_URL   = "redis://127.0.0.1:6379/0"
 python -m pytest -q
 ```
 
@@ -403,6 +542,16 @@ Invoke-RestMethod http://localhost:8000/api/v1/auth/me -Headers @{ Authorization
 
 Try uploading a document, then ask for it with the *other* workspace's id. You get `404`, not `403`.
 
+**And prove the dependencies, from inside the stack:**
+
+```powershell
+docker compose exec redis redis-cli ping                                    # PONG
+docker compose exec api   python -c "import psycopg; from app.db.session import psycopg_dsn; c=psycopg.connect(psycopg_dsn(), connect_timeout=3); print('postgres ok'); c.close()"
+docker compose exec worker python -c "import redis; print('redis ok', redis.Redis.from_url('redis://redis:6379/0', socket_connect_timeout=3).ping())"
+```
+
+Run those from **inside** the containers, not from the host. The host has no PostgreSQL and no Redis — the default stack does not publish those ports on purpose — so a host-side probe tells you about your firewall, not about the application.
+
 ---
 
 ## 10. Design decisions and the alternatives that were rejected
@@ -414,10 +563,18 @@ Try uploading a document, then ask for it with the *other* workspace's id. You g
 | Resource resolved before role | Role checked first (via `Depends`) | The answer would depend on the asker, not the resource |
 | Passwords bcrypt, limit 72 bytes | Pre-hash with SHA-256 | More moving parts for a limit we can simply enforce and report |
 | Rate limit counts failures | Counts attempts | One typo would lock a user out |
-| Rate limit fails open | Fails closed | A Redis outage would become a total login outage |
+| Rate limit fails open by default | Fails closed | A Redis outage would become a total login outage. The mode is configurable (`LOGIN_RATE_LIMIT_FAILURE_MODE=closed`) and logged at startup, so the posture is a decision, not an accident |
+| `503` when the limiter is down and failing closed | `429` | `429` blames the caller for a server-side outage |
+| `.env` resolved from the repository root | `.env` relative to the CWD | The CWD and the file's location are different things; the API then silently uses the wrong addresses |
+| Bounded connect and pool timeouts | Let the OS decide | An unreachable database must fail in seconds, not hang for minutes |
+| A narrow `IllegalStateChangeError` guard in the session teardown | A broad `except Exception` | Masking a race is not fixing it; a broad handler hides real bugs |
+| The API published on `127.0.0.1` only | `0.0.0.0` | A development server should not be reachable from the local network |
+| PostgreSQL and Redis not published to the host | Publish them by default | The default stack has no reason to expose a database to the host; `docker-compose.host-dev.yml` publishes them for the documented host workflow |
+| `AXIOM_`-prefixed variables in Compose | The bare `DATABASE_URL` | Compose also reads the app's `.env` for interpolation, and that file holds the *host* addresses |
 | `X-Forwarded-For` ignored | Trust it | A client could spoof it to escape the per-IP limit |
 | Credentials off in CORS | Credentials on | Bearer tokens do not need them, and off makes wildcard safe |
 | No public registration | `POST /register` | Open signup is an abuse surface; an admin inviting a user is not |
+| A password reset that only updates an existing account | A "forgot password" email flow, or a self-service reset | It is an explicit operator action; it cannot mint accounts or grant roles |
 | Composite FKs | App-level checks only | A bug in application code cannot break the database guarantee |
 | Explicit `create_type=False` | `IF NOT EXISTS` on the ENUM | `IF NOT EXISTS` would *hide* a duplicate instead of fixing it |
 
@@ -427,8 +584,8 @@ Try uploading a document, then ask for it with the *other* workspace's id. You g
 
 Read in this order. Each step builds on the previous.
 
-1. **`app/main.py`** — the whole app in one file. See the three middlewares and the router registrations.
-2. **`app/config.py`** — what the app is allowed to be told.
+1. **`app/main.py`** — the whole app in one file. See the three middlewares, the router registrations and the lifespan.
+2. **`app/config.py`** — what the app is allowed to be told, and where it reads it from.
 3. **`app/api/schemas.py`** — the shape of every message crossing the network.
 4. **`app/api/errors.py`** — the failure contract, and the middleware-order subtlety.
 5. **`app/auth/service.py`** — hashing, tokens, and the "same answer for unknown user and wrong password" rule.
@@ -436,9 +593,12 @@ Read in this order. Each step builds on the previous.
 7. **`app/api/routes/auth.py`** — a small route that ties the service and the dependencies together.
 8. **`app/api/routes/documents.py`** — the workspace isolation pattern, and the status checks.
 9. **`app/api/routes/workspaces.py`** — the provisioning flow.
-10. **`app/auth/rate_limit.py`** and **`app/auth/bootstrap.py`** — the two operational pieces.
-11. **`app/db/models.py`** — the composite foreign keys that make isolation a database guarantee.
-12. **The tests** — `backend/tests/` is the best documentation in the repo. Each test name states a rule in English.
+10. **`app/auth/rate_limit.py`** — the limiter, the failure mode, and what an outage does to it.
+11. **`app/db/session.py`** — the pool, the timeouts, and the session teardown.
+12. **`app/auth/bootstrap.py`** and **`app/auth/password_reset.py`** — the two administrative commands.
+13. **`app/worker/celery_app.py`** and **`app/worker/tasks.py`** — the worker, and why the second file must exist.
+14. **`app/db/models.py`** — the composite foreign keys that make isolation a database guarantee.
+15. **The tests** — `backend/tests/` is the best documentation in the repo. Each test name states a rule in English.
 
 **Then try this:** pick a test in `backend/tests/test_documents.py`, read the test, then read the route it exercises. Every test should be a sentence describing a rule the code enforces.
 
@@ -459,7 +619,12 @@ Read in this order. Each step builds on the previous.
 | **CORS** | The browser rule about which sites may read a response. Not access control. |
 | **Composite foreign key** | A foreign key over several columns, so two tables must agree on *both*. |
 | **Idempotent** | Safe to run twice. The same input produces the same result. |
-| **Status code** | The HTTP number: 200 ok, 202 accepted, 400 bad input, 401 not authenticated, 403 not allowed, 404 not found, 409 conflict, 429 too many requests, 500 server error. |
+| **Fail open / fail closed** | What a component does when a dependency it needs is unavailable. *Open* lets the request through with reduced protection; *closed* refuses it. |
+| **Lifespan** | The start-up and shutdown hooks of an ASGI application. |
+| **Connection pool** | A set of kept-open database connections that requests borrow instead of dialling every time. |
+| **`pool_pre_ping`** | A cheap "SELECT 1" before a pooled connection is handed out, so a connection the database closed while idle is replaced instead of used. |
+| **`SO_REUSEADDR`** | A socket option that, on Windows, allows two processes to bind the same port — the reason two API servers can silently share port 8000. |
+| **Status code** | The HTTP number: 200 ok, 202 accepted, 400 bad input, 401 not authenticated, 403 not allowed, 404 not found, 409 conflict, 429 too many requests, 500 server error, 503 service unavailable. |
 
 ---
 
@@ -467,7 +632,7 @@ Read in this order. Each step builds on the previous.
 
 Being honest about the boundary of this phase:
 
-- **No background processing.** Uploads are validated, stored and queued, but no worker consumes the queue yet. Documents sit in `queued` until Phase 4.
+- **No background processing.** The worker container now starts, connects to the broker and waits for work — but there are no task modules yet, so nothing is ever consumed. Documents sit in `queued` until Phase 4.
 - **No answers.** There is no retrieval, no embedding, no LLM call. The `chunks` and `citations` tables exist and are correct, but nothing writes to them yet.
 - **No conversations.** The tables exist; the `/chat` endpoints arrive in Phase 5.
 - **Tokens cannot be revoked.** `POST /auth/logout` cannot invalidate a token — the server keeps no list. The client discards it. A token also stops working when it expires, and any change to the account takes effect immediately.
@@ -478,7 +643,204 @@ Being honest about the boundary of this phase:
 
 ---
 
-## 14. Where to go next
+## 14. A challenge
+
+Reading a system is not the same as understanding it. These six exercises are built from real failures this codebase actually had — each one was found by running the thing, not by reading it. Do them in order; each one is a small, self-contained investigation.
+
+**Rules of the game.** Do not change the schema, do not delete data, and do not "fix" anything by weakening a check. If a challenge tempts you to make a security control softer, that is the point where you have to stop and think.
+
+---
+
+### Challenge 1 — Two servers, one port
+
+**The situation.** The API answers on `http://localhost:8000`, but some requests fail with "Timeout connecting to server" (Redis) or a PostgreSQL connection timeout, while `/docs` works fine. The symptom looks random.
+
+**Your task.** Find out why the same URL behaves like two different servers.
+
+**Where to look.** `docker-compose.yml` (what the API is published as), `app/config.py` (where `DATABASE_URL` comes from), and the operating system's own answer:
+
+```powershell
+Get-NetTCPConnection -State Listen | Where-Object LocalPort -eq 8000
+Get-CimInstance Win32_Process | Where-Object { $_.Name -match 'python' }
+```
+
+**How to verify.** Start a second API on the host *while* the container is running:
+
+```powershell
+cd backend
+python -m uvicorn app.main:app --host 0.0.0.0 --port 8000
+```
+
+Then compare the two servers. Use your own machine's LAN address for the second one (`Get-NetIPAddress -AddressFamily IPv4`):
+
+```powershell
+(Invoke-WebRequest http://localhost:8000/ready -UseBasicParsing).Content      # the container
+(Invoke-WebRequest http://192.168.100.33:8000/ready -UseBasicParsing).Content  # your host process
+```
+
+The container answers `{"status":"ready", ...}`. The host process answers **503**, because it cannot reach a database that is not published to the host.
+
+**What a good answer says.** On Windows, `SO_REUSEADDR` (which asyncio sets) lets a second process bind a port that is already in use, so the host process starts *without an error*. The container reaches `postgres:5432` and `redis:6379`; the host process reaches `localhost:5432` and `localhost:6379`, which the default stack does not publish — so it times out. The fix is not "retry", it is **one API process at a time**, plus a configuration whose addresses match where the process actually runs.
+
+---
+
+### Challenge 2 — The honest 401
+
+**The situation.** `POST /api/v1/auth/login` answers `401` for `admin@example.com`, and the account certainly exists.
+
+**Your task.** Establish, with evidence, whether this is an infrastructure problem, a code problem or a credential problem — before you touch anything.
+
+**Where to look.** `app/auth/service.py` (`authenticate_user`, `verify_password`), `app/api/routes/auth.py` (`login`), `app/db/session.py`.
+
+**How to verify.**
+
+```powershell
+# is the hash even readable, and does a wrong password really fail?
+docker compose exec api python -c "from sqlalchemy import select; from app.db.session import SessionLocal; from app.db.models import User; from app.auth.service import verify_password; s=SessionLocal(); u=s.execute(select(User)).scalars().first(); print(u.email, u.password_hash[:4], len(u.password_hash), verify_password('not-the-password', u.password_hash))"
+
+# does the API talk to the right database?
+docker compose exec api python -c "from sqlalchemy import select; from app.db.session import SessionLocal; from app.db.models import User; s=SessionLocal(); print([u.email for u in s.execute(select(User)).scalars()])"
+```
+
+**What a good answer says.** The stored value is a valid bcrypt hash; `verify_password` returns `False` for a wrong candidate and `True` for the right one; the API queries the database that holds the account. So the 401 is the *correct* answer to a wrong password — the credential check is honest. The fix is not to weaken the check and not to create a second administrator; it is the explicit procedure in `app/auth/password_reset.py`, which replaces the hash of an **existing** account and preserves its id, email and memberships.
+
+---
+
+### Challenge 3 — Change the posture, on purpose
+
+**The situation.** The login rate limiter fails open by default: if Redis is unreachable, the limiter is bypassed and the outage is logged.
+
+**Your task.** Make the deployment fail *closed* instead, and prove that the difference is visible to a client — and that it is a *server* problem, not a *caller* problem.
+
+**Where to look.** `app/auth/rate_limit.py` (`check_login_allowed`, `LoginDecision`), `app/api/routes/auth.py` (`login`), `app/api/errors.py` (`DependencyUnavailableError`), `app/config.py` (`login_rate_limit_failure_mode`).
+
+**How to verify.**
+
+```powershell
+# switch the posture to "closed" and restart the API with it
+$env:AXIOM_LOGIN_RATE_LIMIT_FAILURE_MODE = "closed"
+docker compose up -d --force-recreate api
+
+# take Redis away
+docker compose stop redis
+
+# a login now cannot be limited, so it cannot be trusted
+Invoke-WebRequest -Method Post -Uri http://localhost:8000/api/v1/auth/login `
+  -ContentType "application/json" -Body '{"email":"admin@example.com","password":"wrong-password-1"}'
+
+# put everything back
+docker compose start redis
+Remove-Item Env:AXIOM_LOGIN_RATE_LIMIT_FAILURE_MODE
+docker compose up -d --force-recreate api
+```
+
+With `closed` the answer is **503 `DEPENDENCY_UNAVAILABLE`**. With `open` (the default) the same request reaches the credential check and answers **401**. Note that the password in the body must be at least 8 characters, or the request is rejected with 422 before any of this happens.
+
+**What a good answer says.** In `open` mode the login proceeds and the credential check still decides the answer. In `closed` mode the endpoint answers **503 `DEPENDENCY_UNAVAILABLE`**, never 429: a 429 would tell the caller to back off and retry, which will not help, and it would disguise a server-side outage as a client error. An unknown mode value must be **rejected at start-up**, because "fail open" and "fail closed" are opposite security decisions and a typo must not pick one for you.
+
+---
+
+### Challenge 4 — The race at shutdown
+
+**The situation.** Stopping the server while a request is waiting for the database produces:
+
+```
+asyncio.exceptions.CancelledError
+sqlalchemy.exc.IllegalStateChangeError: Method 'close()' can't be called here;
+method '_connection_for_bind()' is already in progress
+```
+
+**Your task.** Decide whether this is a harmless shutdown artefact or a real defect — then fix it *without* hiding it.
+
+**Where to look.** `app/db/session.py` (`get_db`, `close_session`), and how FastAPI runs a synchronous handler (a worker thread) and a dependency teardown (possibly another thread).
+
+**How to verify.** The race is reproducible without any timing luck — take the only pooled connection, then close the session from another thread. Run it inside the API container, which already has the right `DATABASE_URL`:
+
+```python
+# docker compose exec api python -
+import threading, time
+from sqlalchemy import create_engine, text
+from sqlalchemy.orm import sessionmaker
+
+from app.config import settings
+
+engine = create_engine(settings.database_url, pool_size=1, max_overflow=0)
+S = sessionmaker(bind=engine)
+holder = S(); holder.execute(text("SELECT 1"))      # takes the only connection
+
+db = S()
+started = threading.Event()
+
+def blocked():
+    started.set()
+    try:
+        db.execute(text("SELECT 1"))               # blocks in the checkout
+    except Exception:
+        pass
+
+t = threading.Thread(target=blocked); t.start()
+started.wait(); time.sleep(0.3)
+db.close()                                          # -> IllegalStateChangeError
+holder.close(); t.join()
+```
+
+There is already a regression test for this: `backend/tests/test_db_session.py::test_closing_a_session_while_a_statement_is_in_flight_does_not_raise`.
+
+**What a good answer says.** It is a real defect, but a *secondary* one: the underlying cause was an unbounded wait for a connection to a database that was not there. The fix is in two parts — bound every wait (`connect_timeout`, `pool_timeout`), and make the teardown tolerate exactly this one race so the original `CancelledError` is not replaced by a confusing internal error. Catching `IllegalStateChangeError` specifically is right; catching `Exception` would hide real bugs.
+
+---
+
+### Challenge 5 — The container that exited with code 1
+
+**The situation.** `docker compose ps` shows the worker as `Exited (1)`. Nothing else in the system complains: the API is healthy, the tests pass, and no document ever moves out of `queued`.
+
+**Your task.** Find the cause, fix it, and add a test that would have caught it *before* it reached a container.
+
+**Where to look.** `docker compose logs worker`, `app/worker/celery_app.py` (the `include` list), and the `app/worker/` package.
+
+**How to verify.**
+
+```powershell
+docker compose logs worker --tail 40
+docker compose run --rm worker celery -A app.worker.celery_app worker --loglevel=info
+```
+
+**What a good answer says.** Celery imports every module in `include` before it starts; `app.worker.tasks` was listed but did not exist, so the worker died with `ModuleNotFoundError` — and because the API does not depend on the worker, nothing noticed. The regression test is `backend/tests/test_worker.py::test_every_included_module_exists`, which imports every module in the include list. The general lesson: **a container that exits quietly is a failure that no test reports unless something imports the same thing.**
+
+---
+
+### Challenge 6 — Write the rule as a test
+
+**The situation.** Some of the rules in this document are only prose. Prose is not enforced.
+
+**Your task.** Pick one rule that is currently *not* covered by a test and turn it into one. Good candidates:
+
+- "the API must never answer a request with an unbounded wait" (assert the engine's timeouts are set);
+- "a failed password reset must not change anything" (assert the hash and the id are untouched);
+- "the rate limiter must not report a failed counter read as zero" (assert `limiter_available` is `False` when Redis fails mid-check);
+- "the worker must be able to import everything it claims to" (already done — find a different one).
+
+**How to verify.** Write the test so that it **fails** when you break the rule, and passes again when you restore it. A test that never fails proves nothing.
+
+```powershell
+docker compose run --rm api sh -c "pip install --no-cache-dir -r requirements-dev.txt && python -m pytest -q tests/test_your_new_file.py"
+```
+
+**What a good answer says.** The test name states the rule in English, the test needs no infrastructure that the rule does not need, and — most importantly — you can describe the exact change that makes it go red. If you cannot make it go red, it is not testing the rule.
+
+---
+
+**When you are done**, you should be able to answer these without looking anything up:
+
+1. Which database is *this* process talking to, and how do you know?
+2. What happens to a login when Redis is down — and who decided that?
+3. Why did `admin@example.com` return 401, and what is the safe way to fix it?
+4. What is the difference between a request that is slow and a request that is gone?
+5. Where would you look first if the worker stopped consuming?
+
+---
+
+## 15. Where to go next
 
 - **Phase 3 — Document Ingestion.** The `FileStorage` abstraction, checksum deduplication, and the upload lifecycle.
 - **Phase 4 — Background Processing.** The Celery worker, the database claim, the sweeper, and retries. This is where `queued` documents start becoming `indexed`.

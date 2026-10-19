@@ -31,8 +31,8 @@ jobs:
           --health-timeout 3s
           --health-retries 10
     env:
-      DATABASE_URL: postgresql+psycopg://axiom:axiom@localhost:5432/axiom
-      REDIS_URL: redis://localhost:6379/0
+      DATABASE_URL: postgresql+psycopg://axiom:axiom@127.0.0.1:5432/axiom
+      REDIS_URL: redis://127.0.0.1:6379/0
     steps:
       - uses: actions/checkout@v4
 
@@ -53,3 +53,20 @@ jobs:
 
       - name: Build Docker image
         run: docker compose build
+
+      - name: Smoke-test the API and the worker containers
+        # The worker used to exit with code 1 (a missing task module) and
+        # nothing reported it: the API does not depend on the worker, and
+        # no test imported the module either. `compose up --wait` fails as
+        # soon as a container exits, which is the check that was missing.
+        #
+        # Starting the API too proves that the image boots with the
+        # configuration the Compose file gives it, and that it reaches
+        # PostgreSQL and Redis over the Compose network.
+        run: |
+          docker compose up -d --wait --wait-timeout 180 api worker
+          docker compose logs worker 2>&1 | grep -E "ready\."
+          curl -fsS http://127.0.0.1:8000/ready
+
+      - name: Stop the containers
+        run: docker compose down
