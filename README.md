@@ -77,6 +77,16 @@ DELETE /api/v1/documents/{id}
 
 Every error uses one envelope: `{"error": {"code", "message", "retryable", "request_id"}}`.
 
+### Choosing a workspace
+
+The endpoints that act "in a workspace" accept an optional `X-Workspace-ID` header. It is declared in the OpenAPI schema, so Swagger UI shows the field and the generated cURL includes it.
+
+- An account that belongs to **exactly one** workspace does not need to send it; the server selects that workspace.
+- An account that belongs to **several** workspaces must send the id of the one it wants to act in, otherwise the request is refused with `403` and a message naming the header.
+- The value only *selects* among the caller's own workspaces; it never grants access to one.
+
+Paths that already name the workspace (`/api/v1/workspaces/{id}`, `/api/v1/workspaces/{id}/members`) do not use the header at all.
+
 ### Not implemented yet
 
 - Background document processing (the Celery worker and PDF extraction)

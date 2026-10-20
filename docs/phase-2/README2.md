@@ -252,6 +252,28 @@ The server signs it with `JWT_SECRET_KEY`. The server can therefore check "did I
 
 **Why there are two "require role" variants.** `require_role` resolves the workspace from the `X-Workspace-ID` header. `require_workspace_role` resolves it from the **route path**. For `POST /workspaces/{id}/members` the path is authoritative — otherwise a caller could point a path-scoped route at a different workspace through a header.
 
+**The concept: a requirement the schema does not declare does not exist.** Look at how the workspace header is declared:
+
+```python
+def get_current_membership(
+    current_user: CurrentUser = Depends(get_current_user),
+    requested_workspace: Optional[str] = Header(default=None, alias=WORKSPACE_HEADER),
+    db: Session = Depends(get_db),
+) -> CurrentMembership:
+```
+
+It could have been written as `request.headers.get(WORKSPACE_HEADER)` — the obvious way, and it works perfectly at runtime. But **FastAPI builds the OpenAPI schema from function signatures only**. A header read imperatively from the raw request never reaches the schema, so Swagger UI renders no field for it, the generated cURL omits it, and the only symptom a caller ever sees is a `403` they cannot diagnose. The header was read that way, and the documentation interface could not offer it.
+
+Declaring it with `Header(alias=...)` is what puts it in the contract:
+
+```json
+{"name": "X-Workspace-ID", "in": "header", "required": false, "description": "..."}
+```
+
+Note `required: false`, on purpose. The header is *demanded* only when the account belongs to several workspaces; an account with exactly one membership is served without it, and the server selects that membership itself. Marking it required would force single-workspace clients to send a value they do not have.
+
+The rule to take away: **if the server enforces it, the schema must declare it** — otherwise the client cannot comply. `backend/tests/test_openapi.py` is the test that keeps the two in step.
+
 ---
 
 ### 5.6 `app/api/routes/` — the HTTP surface

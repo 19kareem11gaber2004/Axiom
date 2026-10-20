@@ -20,7 +20,7 @@ import uuid
 from dataclasses import dataclass
 from typing import Optional, Tuple
 
-from fastapi import Depends, Request
+from fastapi import Depends, Header, Request
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -37,6 +37,10 @@ bearer_scheme = HTTPBearer(auto_error=False)
 # Optional header a client may send to select one of several workspaces
 # it belongs to. The value is verified against the database; it never
 # grants access on its own.
+#
+# It is declared as a FastAPI Header parameter in get_current_membership
+# (see the comment there). Declaring it is what puts it in the OpenAPI
+# schema, and therefore in the Swagger UI and in the generated cURL.
 WORKSPACE_HEADER = "X-Workspace-ID"
 
 # Relative authority of each workspace role.
@@ -165,8 +169,18 @@ def get_current_user(
 
 
 def get_current_membership(
-    request: Request,
     current_user: CurrentUser = Depends(get_current_user),
+    requested_workspace: Optional[str] = Header(
+        default=None,
+        alias=WORKSPACE_HEADER,
+        description=(
+            "Workspace to act in. Optional when the account belongs to "
+            "exactly one workspace, which is then selected automatically. "
+            "Required when the account belongs to several. The value is "
+            "verified against the caller's memberships; it never grants "
+            "access on its own."
+        ),
+    ),
     db: Session = Depends(get_db),
 ) -> CurrentMembership:
     """Resolve the caller's membership in the workspace they are acting in.
@@ -174,10 +188,17 @@ def get_current_membership(
     The workspace comes from the X-Workspace-ID header, or from the only
     membership the caller has. The header is verified against the
     database; it never grants access on its own.
+
+    The header is **declared** here rather than read from the raw
+    request. FastAPI builds the OpenAPI schema from function signatures
+    only, so a header read imperatively (``request.headers.get(...)``)
+    works at runtime but is invisible to the schema generator: it never
+    reaches the OpenAPI document, Swagger UI renders no field for it and
+    the generated cURL omits it. Declaring it here is what makes the
+    requirement visible to the client while the server-side check stays
+    exactly where it was.
     """
-    workspace_id, role = _resolve_workspace(
-        db, current_user.id, request.headers.get(WORKSPACE_HEADER)
-    )
+    workspace_id, role = _resolve_workspace(db, current_user.id, requested_workspace)
     return CurrentMembership(
         user=current_user, workspace_id=workspace_id, role=role
     )

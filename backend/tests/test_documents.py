@@ -119,11 +119,12 @@ def _auth(account, workspace_id=None):
     return headers
 
 
-def _upload(account, content=PDF_BYTES, filename="report.pdf"):
+def _upload(account, content=PDF_BYTES, filename="report.pdf", workspace_id=None):
+    """Upload a file as `account`, optionally selecting a workspace."""
     return client.post(
         "/api/v1/documents",
         files={"file": (filename, io.BytesIO(content), "application/pdf")},
-        headers=_auth(account),
+        headers=_auth(account, workspace_id),
     )
 
 
@@ -177,6 +178,96 @@ def test_upload_writes_the_file_to_the_agreed_layout(member, db_session):
     path = uploads.absolute_path("uploads/%s/original.pdf" % document_id)
     assert path.exists()
     assert path.read_bytes() == PDF_BYTES
+
+
+# ---------------------------------------------------------------------------
+# Workspace selection during an upload
+#
+# A user who belongs to several workspaces must say which one the
+# document belongs to. The header that carries that choice is the same
+# one the OpenAPI schema declares, so a client can actually send it.
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def member_of_two_workspaces(db_session):
+    """A 'member' in two workspaces."""
+    first = _make_workspace(db_session)
+    second = _make_workspace(db_session)
+    account = _make_user(db_session, first, "member")
+    db_session.add(
+        WorkspaceMembership(
+            user_id=account["user_id"], workspace_id=second.id, role="member"
+        )
+    )
+    db_session.flush()
+    account["second_workspace_id"] = second.id
+    return account
+
+
+def test_upload_without_a_workspace_choice_is_refused_when_ambiguous(
+    member_of_two_workspaces,
+):
+    """Two workspaces, no choice: the server must not guess."""
+    r = _upload(member_of_two_workspaces)
+
+    assert r.status_code == 403
+    assert r.json()["error"]["code"] == "FORBIDDEN"
+    assert "X-Workspace-ID" in r.json()["error"]["message"]
+
+
+def test_upload_succeeds_with_an_authorized_workspace(
+    member_of_two_workspaces, db_session
+):
+    """The header selects the workspace the document belongs to."""
+    r = _upload(
+        member_of_two_workspaces,
+        workspace_id=member_of_two_workspaces["second_workspace_id"],
+    )
+
+    assert r.status_code == 202, r.json()
+    document_id = uuid.UUID(r.json()["document_id"])
+    document = db_session.execute(
+        select(Document).where(Document.id == document_id)
+    ).scalar_one()
+    # The document is attached to the SELECTED workspace, not the first.
+    assert document.workspace_id == member_of_two_workspaces["second_workspace_id"]
+    assert document.uploaded_by == member_of_two_workspaces["user_id"]
+
+
+def test_upload_with_the_first_workspace_still_works(member_of_two_workspaces):
+    """Either of the caller's own workspaces is a valid choice."""
+    r = _upload(
+        member_of_two_workspaces,
+        workspace_id=member_of_two_workspaces["workspace_id"],
+    )
+
+    assert r.status_code == 202, r.json()
+
+
+def test_upload_rejects_a_workspace_the_caller_does_not_belong_to(
+    member_of_two_workspaces, db_session
+):
+    """The header selects; it never grants."""
+    foreign = _make_workspace(db_session)
+
+    r = _upload(member_of_two_workspaces, workspace_id=foreign.id)
+
+    assert r.status_code == 403
+    assert r.json()["error"]["code"] == "FORBIDDEN"
+
+
+def test_upload_rejects_a_malformed_workspace_header(member):
+    r = _upload(member, workspace_id="not-a-uuid")
+
+    assert r.status_code == 403
+    assert r.json()["error"]["code"] == "FORBIDDEN"
+
+
+def test_upload_by_a_single_workspace_member_needs_no_header(member):
+    """One workspace: the header is optional and the server selects it."""
+    r = _upload(member)
+
+    assert r.status_code == 202, r.json()
 
 
 def test_upload_rejects_a_non_pdf_extension(member):
