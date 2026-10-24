@@ -188,10 +188,16 @@ class DocumentListResponse(BaseModel):
 
 
 class DocumentUploadResponse(BaseModel):
-    """Response returned immediately after a document is queued for processing."""
+    """Response returned immediately after a document is queued for processing.
+
+    ``duplicate`` is true only when an existing document with the same
+    checksum was returned instead of creating a new one. It defaults to
+    false so the retry endpoint keeps its existing response shape.
+    """
 
     document_id: UUID
     status: str
+    duplicate: bool = False
 
 
 # ---------------------------------------------------------------------------

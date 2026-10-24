@@ -141,3 +141,40 @@ def test_the_upload_still_takes_a_multipart_file(schema):
     content = operation["requestBody"]["content"]
     assert "multipart/form-data" in content
     assert "202" in operation["responses"]
+
+
+def test_the_upload_documents_both_success_codes(schema):
+    """A client must be able to generate handlers for both outcomes."""
+    operation = schema["paths"]["/api/v1/documents"]["post"]
+
+    assert set(operation["responses"]) >= {"200", "202"}
+    for code in ("200", "202"):
+        assert "application/json" in operation["responses"][code]["content"]
+
+
+def test_the_upload_declares_allow_duplicate(schema):
+    operation = schema["paths"]["/api/v1/documents"]["post"]
+    query = {
+        parameter["name"]: parameter
+        for parameter in operation.get("parameters", [])
+        if parameter.get("in") == "query"
+    }
+
+    assert "allow_duplicate" in query
+    assert query["allow_duplicate"]["schema"]["type"] == "boolean"
+    assert query["allow_duplicate"].get("required", False) is False
+
+
+@pytest.mark.parametrize("code", ["200", "202"])
+def test_each_upload_response_documents_duplicate(schema, code):
+    operation = schema["paths"]["/api/v1/documents"]["post"]
+    response_schema = operation["responses"][code]["content"]["application/json"][
+        "schema"
+    ]
+
+    if "$ref" in response_schema:
+        name = response_schema["$ref"].rsplit("/", 1)[-1]
+        response_schema = schema["components"]["schemas"][name]
+
+    assert "duplicate" in response_schema["properties"]
+    assert response_schema["properties"]["duplicate"]["default"] is False

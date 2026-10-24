@@ -6,9 +6,11 @@ Axiom is an enterprise knowledge platform designed to help organizations ingest,
 
 The project follows an engineering-first approach, prioritizing secure data access, measurable retrieval quality, reliable infrastructure, and incremental delivery over a basic chatbot implementation.
 
-> **Current milestone:** Phase 2 — Backend Foundation  
-> **Current focus:** Authentication, workspace-scoped authorization, document management, and a tested persistence layer  
-> **Application status:** Secure API foundation; retrieval and generation are planned, not yet implemented.
+> **Current milestone:** Phase 3 — Document Ingestion
+>
+> **Current focus:** Durable file storage, workspace-scoped duplicate detection, and the upload lifecycle
+>
+> **Application status:** Secure API foundation with durable document ingestion; retrieval and generation are planned, not yet implemented.
 
 ---
 
@@ -49,21 +51,25 @@ The platform is being developed incrementally, beginning with a reliable backend
 
 ## Current Status
 
-The current milestone is the **Backend Foundation** (Phase 2): a secure, workspace-scoped API with authentication, document management, and a tested persistence layer.
+The current milestone is **Document Ingestion** (Phase 3): a secure, workspace-scoped API that stores uploaded PDFs durably, detects duplicate content, and hands a readable file to the future worker.
 
 | Component | Current scope |
 |---|---|
-| FastAPI | Application, structured error envelope, request IDs, 10 versioned endpoints under `/api/v1` |
+| FastAPI | Application, structured error envelope, request IDs, 13 versioned operations across 10 paths under `/api/v1` |
 | PostgreSQL + pgvector | Persistent storage, workspace-scoped schema, vector column |
 | SQLAlchemy | 9 models, composite foreign keys enforcing workspace isolation |
-| Alembic | Version-controlled migrations (revision `0001`, verified on a real pgvector server) |
+| Alembic | Version-controlled migrations (revision `0001`, verified on a real pgvector server); Phase 3 needs no new migration |
 | Redis | Broker infrastructure **and** login rate limiting |
-| Celery | Asynchronous task-processing foundation |
+| Celery | Asynchronous task-processing foundation; document tasks arrive in Phase 4 |
+| File storage | `FileStorage` port with a local atomic adapter; the API and worker share a Compose bind mount |
+| Deduplication | Workspace-scoped SHA-256, advisory; new uploads `202`, duplicates `200` |
 | Docker Compose | Local multi-service environment |
-| Pytest | 153 tests: unit, HTTP, and real PostgreSQL/Redis integration |
-| GitHub Actions | Automated CI workflow (migration, tests, compose validation, image build) |
+| Pytest | 351 tests: unit, HTTP, and real PostgreSQL/Redis integration |
+| GitHub Actions | Automated CI workflow (migration, tests, compose validation, image build, shared-storage smoke check) |
 
 ### Implemented endpoints
+
+Thirteen versioned operations across ten `/api/v1` paths:
 
 ```
 POST   /api/v1/auth/login                  POST   /api/v1/auth/logout
@@ -76,6 +82,22 @@ DELETE /api/v1/documents/{id}
 ```
 
 Every error uses one envelope: `{"error": {"code", "message", "retryable", "request_id"}}`.
+
+### Upload identity and duplicate behavior
+
+`POST /api/v1/documents` identifies content by the **SHA-256 digest of its bytes**, scoped to the caller's workspace. The filename is metadata only.
+
+| Request | Result |
+|---|---|
+| New content | `202` with a new `document_id`, `status: "queued"`, `duplicate: false` |
+| Same bytes already in this workspace | `200` with the existing `document_id`, its current status, and `duplicate: true` |
+| Same bytes with `?allow_duplicate=true` | `202` with a new document and a new file |
+| Same bytes in another workspace | `202` with a new document; dedup never crosses a workspace |
+| Existing match is `failed` | `200` with `duplicate: true`; retry it or force a new upload |
+
+A duplicate is a successful lookup, not an error. It does **not** create a new file or row, and it does not change the existing document's metadata or status. Deduplication is **advisory**: two concurrent identical uploads can both create documents. The resulting `duplicate` field is part of the upload response, and both `200` and `202` are documented in the OpenAPI schema.
+
+For the design rationale, the storage port, transaction ordering, and exercises, see [`docs/phase-3/README3.md`](docs/phase-3/README3.md).
 
 ### Choosing a workspace
 
@@ -112,27 +134,28 @@ Axiom begins as a **modular monolith**: one backend application with clearly sep
                       FastAPI API
                             |
              +--------------+--------------+
-             |                             |
-             v                             v
-        PostgreSQL                      Redis
-        + pgvector                        |
-             |                            v
-             |                       Celery Worker
-             |                            |
-             +----------------------------+
-                   Shared Infrastructure
+             |              |              |
+             v              v              v
+        PostgreSQL        Redis       FileStorage
+        + pgvector          |       (local root or
+             ^              v        bind mount)
+             |        Celery Worker
+             |              |
+             +--------------+
+                  Shared infrastructure
 ```
 
-The diagram represents the planned service relationships at the infrastructure level. Document-processing and retrieval workflows will be added in subsequent milestones.
+The diagram represents the infrastructure relationships at a high level. Document-processing and retrieval workflows will be added in subsequent milestones.
 
 ### Architectural responsibilities
 
-- **API layer:** Exposes HTTP endpoints and handles incoming requests.
-- **Database layer:** Persists application data and will support vector retrieval.
+- **API layer:** Exposes HTTP endpoints, authenticates callers, and maps domain errors to the common envelope.
+- **Database layer:** Persists application data, workspace memberships, document metadata, and vector-ready tables.
+- **File storage layer:** Stores original bytes behind the `FileStorage` port; `LocalFileStorage` is the Phase 3 adapter, and the API and worker share the same root.
 - **Message broker:** Redis provides the transport infrastructure for background tasks.
-- **Worker layer:** Celery provides the execution environment for asynchronous jobs.
+- **Worker layer:** Celery provides the execution environment for asynchronous jobs; document tasks arrive in Phase 4.
 - **Migration layer:** Alembic manages version-controlled database schema changes.
-- **CI pipeline:** Validates migrations, tests, configuration, and the backend image.
+- **CI pipeline:** Validates migrations, tests, configuration, the backend image, and shared API/worker storage.
 
 The initial migration is intended to establish nine application tables, together with the required PostgreSQL extension, enum types, constraints, and indexes. The actual migration must be executed successfully against PostgreSQL to verify the resulting schema.
 
@@ -148,6 +171,8 @@ The initial migration is intended to establish nine application tables, together
 | Vector infrastructure | pgvector | Vector storage and similarity-search support |
 | ORM | SQLAlchemy | Database interaction |
 | Migrations | Alembic | Schema versioning |
+| File storage | `FileStorage` port + local adapter | Durable upload bytes with an object-store seam |
+| Deduplication | Workspace-scoped SHA-256 | Advisory content identity for idempotent uploads |
 | Message broker | Redis | Background-task transport |
 | Task processing | Celery | Asynchronous job execution |
 | Containerization | Docker | Reproducible application environment |
@@ -495,7 +520,7 @@ python -m pytest -q
 Set-Location ..
 ```
 
-The suite contains 153 tests. Tests that need PostgreSQL or Redis are **skipped** when those services are unreachable, so the suite still runs offline:
+The suite contains 351 tests. Tests that need PostgreSQL or Redis are **skipped** when those services are unreachable, so the suite still runs offline:
 
 ```powershell
 Set-Location backend
@@ -628,6 +653,7 @@ The intended pipeline includes:
 5. Running automated tests.
 6. Validating the Docker Compose configuration.
 7. Building the backend Docker image.
+8. Verifying that the API and worker can read and write the same storage root.
 
 CI helps identify regressions before changes are merged. It does not automatically repair faulty code or guarantee production readiness.
 
@@ -650,6 +676,12 @@ Axiom/
 │   ├── app/
 │   │   ├── ai_workflow/
 │   │   ├── api/
+│   │   │   ├── errors.py
+│   │   │   ├── schemas.py
+│   │   │   └── routes/
+│   │   │       ├── auth.py
+│   │   │       ├── documents.py
+│   │   │       └── workspaces.py
 │   │   ├── auth/
 │   │   │   ├── bootstrap.py
 │   │   │   ├── dependencies.py
@@ -660,24 +692,23 @@ Axiom/
 │   │   │   ├── models.py
 │   │   │   └── session.py
 │   │   ├── ingestion/
+│   │   │   ├── service.py
 │   │   │   └── validation.py
 │   │   ├── retrieval/
 │   │   ├── storage/
-│   │   │   └── uploads.py
+│   │   │   ├── __init__.py
+│   │   │   ├── base.py
+│   │   │   ├── keys.py
+│   │   │   └── local.py
 │   │   ├── worker/
 │   │   │   ├── celery_app.py
 │   │   │   └── tasks.py
-│   │   ├── api/
-│   │   │   ├── errors.py
-│   │   │   ├── schemas.py
-│   │   │   └── routes/
-│   │   │       ├── auth.py
-│   │   │       ├── documents.py
-│   │   │       └── workspaces.py
 │   │   ├── config.py
 │   │   └── main.py
 │   ├── tests/
 │   │   ├── conftest.py
+│   │   ├── fakes/
+│   │   │   └── storage.py
 │   │   ├── test_auth_api.py
 │   │   ├── test_auth_dependencies.py
 │   │   ├── test_auth_service.py
@@ -688,20 +719,36 @@ Axiom/
 │   │   ├── test_documents.py
 │   │   ├── test_errors.py
 │   │   ├── test_health.py
+│   │   ├── test_ingestion_service.py
 │   │   ├── test_lifespan.py
 │   │   ├── test_migration_sql.py
+│   │   ├── test_openapi.py
 │   │   ├── test_rate_limit.py
 │   │   ├── test_readiness.py
 │   │   ├── test_ready.py
 │   │   ├── test_smoke_integration.py
+│   │   ├── test_storage.py
+│   │   ├── test_storage_port.py
 │   │   ├── test_worker.py
 │   │   └── test_workspaces.py
+│   ├── .dockerignore
 │   ├── Dockerfile
 │   ├── alembic.ini
 │   ├── requirements.txt
 │   └── requirements-dev.txt
 ├── docs/
-│   └── phase-1/
+│   ├── phase-1/
+│   │   ├── 01-user-stories.md
+│   │   ├── 02-architecture.md
+│   │   ├── 03-erd-api.md
+│   │   ├── 04-state-machine.md
+│   │   ├── 05-job-contract.md
+│   │   ├── 06-arabic-scope.md
+│   │   └── 07-decision-log.md
+│   ├── phase-2/
+│   │   └── README2.md
+│   └── phase-3/
+│       └── README3.md
 ├── eval/
 │   └── v0.1/
 │       ├── corpus.lock
@@ -715,7 +762,7 @@ Axiom/
 └── README.md
 ```
 
-The `retrieval/` module is still empty: retrieval is not implemented yet.
+At runtime, `backend/storage/` holds uploaded files. It is excluded from the image and from git, and Compose bind-mounts it into both the API and worker containers. The `retrieval/` module is still empty: retrieval is not implemented yet.
 
 ---
 
@@ -727,14 +774,16 @@ Axiom will progress through incremental milestones with explicit acceptance crit
 |---|---|---|---|
 | 1 | Walking Skeleton | Application startup, infrastructure, migrations, health checks, tests, and CI | Done |
 | 2 | Backend Foundation | Configuration, persistence, authentication, workspace-scoped authorization, document management, error envelope, CORS, rate limiting | Done |
-| 3 | Document Ingestion | File storage abstraction, duplicate detection, and the upload lifecycle | Next |
-| 4 | Background Processing | Celery worker, database claim, sweeper, retries, and failure recovery | Planned |
+| 3 | Document Ingestion | `FileStorage` port and local adapter, workspace-scoped SHA-256 deduplication, upload lifecycle, and shared API/worker storage | Done |
+| 4 | Background Processing | Celery worker, database claim, sweeper, retries, and failure recovery | Next |
 | 5 | PDF RAG MVP | PDF extraction, chunking, embeddings, retrieval, citations, and abstention | Planned |
 | 6 | Retrieval Evaluation | Baselines, vector-versus-hybrid comparisons, reranking experiments, and quality metrics | Planned |
 | 7 | Multimodal Retrieval | Evaluated extensions for additional document modalities | Planned |
 | 8 | Agentic Workflows | Controlled tool use, workflow orchestration, and human review where appropriate | Planned |
 
 Phase 6 will build on the PDF MVP rather than expanding the system before a measurable retrieval baseline exists. Its comparisons will be driven by evaluation results instead of assumptions that more complex retrieval is automatically better.
+
+Phase 3 is explained in depth in [`docs/phase-3/README3.md`](docs/phase-3/README3.md); the Phase 2 guide remains at [`docs/phase-2/README2.md`](docs/phase-2/README2.md).
 
 ---
 
@@ -763,11 +812,14 @@ Complete and verify one milestone before adding complexity. Document important a
 ## Current Limitations
 
 - Axiom is currently a secure API foundation, not a functioning RAG application. No answer is generated yet.
-- **No background processing.** Uploads are validated, stored, and queued, but no Celery task consumes the queue: documents stay in `queued` until the worker lands in Phase 4.
+- **No background processing.** Uploads are validated, stored, and queued, but no Celery task consumes the queue: documents stay in `queued` until document-processing tasks land in Phase 4.
 - **Access tokens are stateless.** `POST /auth/logout` cannot revoke a token on the server; the client discards it. There is no token blocklist and no refresh token. Workspace and role are re-read from the database on every request, so a revoked membership or a demotion takes effect immediately.
 - **The login rate limiter fails open by default.** If Redis is unreachable the limiter is bypassed and a warning is logged, because failing closed would turn a Redis outage into a total login outage. The credential check still applies. The posture is configurable (`LOGIN_RATE_LIMIT_FAILURE_MODE=closed` refuses logins with 503 while the limiter is unreachable) and is logged at startup.
 - **`X-Forwarded-For` is not trusted.** The per-IP login limit sees the proxy address behind a reverse proxy. Honouring the header is a deployment concern, because a client could otherwise spoof it to escape the limit.
-- **The document file store is local.** Files live under `backend/storage/` and are removed with the document. The `FileStorage` abstraction that allows an object store arrives in Phase 3.
+- **The document file store is local.** `LocalFileStorage` is the only implemented `FileStorage` adapter; an object-store implementation is not included yet. Files live under `backend/storage/` on the host and are removed when the document is deleted.
+- **The shared storage mount is a local-development arrangement.** Compose bind-mounts `./backend/storage` into both the API and worker at `/srv/backend/storage`, so both processes see the same bytes. A multi-host production deployment needs an object store or a shared filesystem; the bind mount is not that solution.
+- **Deduplication is advisory, not a uniqueness guarantee.** The `(workspace_id, checksum)` index is non-unique, and the service performs a check-then-insert. Two concurrent identical uploads can both create documents. This is intentional so `allow_duplicate=true` and legitimate re-uploads remain possible; strict idempotency would need a separate idempotency key or conflict path.
+- **The file store and database are not atomic.** Uploads write the file before committing the row, and failures are compensated best-effort. A process crash between the file write and the commit can leave an unreferenced object; the current system has no orphan-file collector. Delete has the symmetric crash window: a file removed before a failed commit leaves a row with a missing file until a retry completes the delete.
 - **Only PDF uploads are accepted**, and only a plain `%PDF-` signature is checked. Page count, character count, and processing-time limits arrive with the worker.
 - **No `audit_logs` table yet.** Document deletion writes a structured log line; the permanent audit trail is Phase 10.
 - **The evaluation directory is scaffolding.** It provides a frozen corpus, a schema, and 20 seed questions, but no retrieval or generation quality has been measured.
@@ -778,13 +830,15 @@ Complete and verify one milestone before adding complexity. Document important a
 
 ## Stopping the Environment
 
+Uploaded documents live in the host directory `backend/storage/`, which Compose bind-mounts into both the `api` and `worker` containers at `/srv/backend/storage`. Both services therefore see the same files, and the files survive container recreation and `docker compose down -v`.
+
 ### Stop containers and preserve data
 
 ```powershell
 docker compose down
 ```
 
-This stops and removes the Compose containers and network while preserving named volumes.
+This stops and removes the Compose containers and network while preserving named volumes and the bind-mounted uploads.
 
 ### Stop containers and delete persistent data
 
@@ -792,12 +846,21 @@ This stops and removes the Compose containers and network while preserving named
 docker compose down -v
 ```
 
-**Warning:** This removes the named volumes associated with the Compose project, including persistent PostgreSQL and Redis data stored in those volumes. Use it only when a complete local reset is intentional.
+**Warning:** This removes the named volumes associated with the Compose project, including persistent PostgreSQL and Redis data stored in those volumes. It does **not** delete files in the bind-mounted `backend/storage/` directory, because Docker does not remove bind-mounted host directories.
 
-| Command | Containers | Named volumes |
-|---|---|---|
-| `docker compose down` | Removed | Preserved |
-| `docker compose down -v` | Removed | Removed |
+To delete uploaded files as well, stop the stack first and then remove the host directory:
+
+```powershell
+docker compose down -v
+Remove-Item -Recurse -Force backend\storage -ErrorAction SilentlyContinue
+```
+
+Use this only when a complete local reset is intentional.
+
+| Command | Containers | Named volumes | Uploaded files (`backend/storage/`) |
+|---|---|---|---|
+| `docker compose down` | Removed | Preserved | Preserved |
+| `docker compose down -v` | Removed | Removed | Preserved |
 
 ---
 

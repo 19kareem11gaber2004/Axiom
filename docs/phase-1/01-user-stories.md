@@ -12,8 +12,8 @@ Scope: PDF-only text RAG MVP (end of Phase 5). Workspace-scoped auth. Async inde
 **As a** knowledge worker, **I want** to upload a PDF to my workspace **so that** it can be indexed without blocking my request.
 
 Acceptance:
-- `POST /api/v1/documents` accepts PDF only, enforces size limit, validates extension + magic bytes, stores via internal name.
-- Returns `202 Accepted` with `document_id` and `status: queued`.
+- `POST /api/v1/documents` accepts PDF only, enforces size limit, validates extension + magic bytes, stores via a server-generated key, and deduplicates by workspace-scoped SHA-256.
+- Returns `202 Accepted` with `document_id` and `status: queued` for new content; returns `200 OK` with `duplicate: true` and the existing document when the same bytes already exist in the workspace. `allow_duplicate=true` forces a new document.
 - Record persists across API restart (`GET /api/v1/documents/{id}` returns metadata).
 - Maps to FR-01, FR-02.
 
@@ -22,7 +22,7 @@ Acceptance:
 **As a** knowledge worker, **I want** to see processing status and retry failures **so that** I know when a document is searchable.
 
 Acceptance:
-- `GET /api/v1/documents` / `GET /api/v1/documents/{id}` expose `uploaded → queued → processing → retrying → indexed / failed`.
+- `GET /api/v1/documents` / `GET /api/v1/documents/{id}` expose `queued → processing → retrying → indexed / failed`. Phase 3 creates documents in `queued`; `uploaded` is reserved for the Phase 4 save-succeeded / enqueue-failed recovery path.
 - `failed` includes actionable `error_code` + `message`, no internal stack traces.
 - `POST /api/v1/documents/{id}/retry` works only from `failed` (retryable) and never duplicates chunks.
 - Maps to FR-03, FR-10.

@@ -1,8 +1,9 @@
 """Tests for the document routes (Phase 2, step 2.5).
 
-Covers upload validation, workspace isolation, role enforcement, status
-transitions and the authorized download path, against a real PostgreSQL
-database and the real local filesystem.
+Covers upload validation, deduplication, workspace isolation, role
+enforcement, status transitions and the authorized download path, against
+a real PostgreSQL database and an isolated temporary LocalFileStorage
+adapter. No test writes to ``backend/storage``.
 """
 
 import io
@@ -15,7 +16,10 @@ from sqlalchemy import select
 from app.auth.service import create_access_token
 from app.db.models import Document, User, Workspace, WorkspaceMembership
 from app.main import app
-from app.storage import uploads
+from app.storage import get_storage
+from app.storage.base import StoragePathError, StorageUnavailableError
+from app.storage.keys import storage_key_for
+from app.storage.local import LocalFileStorage
 
 client = TestClient(app, raise_server_exceptions=False)
 
@@ -23,32 +27,41 @@ client = TestClient(app, raise_server_exceptions=False)
 PDF_BYTES = b"%PDF-1.7\n1 0 obj\n<< /Type /Catalog >>\nendobj\ntrailer\n%%EOF\n"
 
 
-def _pdf(content: bytes = PDF_BYTES) -> bytes:
-    return content
+class RecordingStorage(LocalFileStorage):
+    """A real local adapter that records route operations for assertions."""
+
+    def __init__(self, root) -> None:
+        super().__init__(root)
+        self.saved: list[tuple[str, bytes]] = []
+        self.reads: list[str] = []
+        self.deleted: list[str] = []
+
+    def save(self, key: str, content: bytes) -> None:
+        self.saved.append((key, content))
+        super().save(key, content)
+
+    def read(self, key: str) -> bytes:
+        self.reads.append(key)
+        return super().read(key)
+
+    def delete(self, key: str) -> bool:
+        self.deleted.append(key)
+        return super().delete(key)
 
 
 @pytest.fixture(autouse=True)
-def clean_uploaded_files():
-    """Remove files written by the test.
+def route_storage(tmp_path):
+    """Give every route test an isolated storage root under ``tmp_path``."""
+    storage = RecordingStorage(tmp_path / "storage")
+    app.dependency_overrides[get_storage] = lambda: storage
+    try:
+        yield storage
+    finally:
+        app.dependency_overrides.pop(get_storage, None)
 
-    The database transaction is rolled back, but the bytes on disk are
-    not, so each test removes whatever it created.
-    """
-    root = uploads.storage_root() / "uploads"
-    before = set(root.iterdir()) if root.exists() else set()
-    yield
-    after = set(root.iterdir()) if root.exists() else set()
-    for entry in after - before:
-        if entry.is_dir():
-            for child in entry.rglob("*"):
-                if child.is_file():
-                    child.unlink()
-            for child in sorted(entry.rglob("*"), reverse=True):
-                if child.is_dir():
-                    child.rmdir()
-            entry.rmdir()
-        else:
-            entry.unlink()
+
+def _pdf(content: bytes = PDF_BYTES) -> bytes:
+    return content
 
 
 def _make_user(db_session, workspace, role):
@@ -119,13 +132,32 @@ def _auth(account, workspace_id=None):
     return headers
 
 
-def _upload(account, content=PDF_BYTES, filename="report.pdf", workspace_id=None):
+def _upload(
+    account,
+    content=PDF_BYTES,
+    filename="report.pdf",
+    workspace_id=None,
+    allow_duplicate=False,
+):
     """Upload a file as `account`, optionally selecting a workspace."""
+    params = {"allow_duplicate": "true"} if allow_duplicate else None
     return client.post(
         "/api/v1/documents",
         files={"file": (filename, io.BytesIO(content), "application/pdf")},
         headers=_auth(account, workspace_id),
+        params=params,
     )
+
+
+def _documents(db_session, workspace_id) -> list[Document]:
+    """Return the documents in one workspace.
+
+    The database may contain rows from other tests or manual runs; only
+    the workspace created by this test is under test.
+    """
+    return db_session.execute(
+        select(Document).where(Document.workspace_id == workspace_id)
+    ).scalars().all()
 
 
 # ---------------------------------------------------------------------------
@@ -153,6 +185,7 @@ def test_upload_returns_202_and_queues_the_document(member):
     body = r.json()
     assert body["status"] == "queued"
     assert body["document_id"]
+    assert body["duplicate"] is False
 
 
 def test_upload_persists_the_document_record(member, db_session):
@@ -168,16 +201,79 @@ def test_upload_persists_the_document_record(member, db_session):
     assert document.mime_type == "application/pdf"
     assert document.size_bytes == len(PDF_BYTES)
     assert document.checksum
-    assert document.storage_key == "uploads/%s/original.pdf" % document_id
+    assert document.storage_key == storage_key_for(document_id)
 
 
-def test_upload_writes_the_file_to_the_agreed_layout(member, db_session):
+def test_upload_writes_the_file_to_the_agreed_layout(member, route_storage):
     r = _upload(member)
     document_id = uuid.UUID(r.json()["document_id"])
+    key = storage_key_for(document_id)
 
-    path = uploads.absolute_path("uploads/%s/original.pdf" % document_id)
-    assert path.exists()
-    assert path.read_bytes() == PDF_BYTES
+    assert route_storage.exists(key) is True
+    assert route_storage.read(key) == PDF_BYTES
+    assert route_storage.saved == [(key, PDF_BYTES)]
+
+
+def test_duplicate_upload_returns_200_without_writing_again(
+    member, db_session, route_storage
+):
+    first = _upload(member)
+    second = _upload(member, filename="copy.pdf")
+
+    assert first.status_code == 202, first.json()
+    assert second.status_code == 200, second.json()
+    assert second.json()["document_id"] == first.json()["document_id"]
+    assert second.json()["status"] == first.json()["status"]
+    assert second.json()["duplicate"] is True
+    assert len(route_storage.saved) == 1
+    assert len(_documents(db_session, member["workspace_id"])) == 1
+
+
+def test_allow_duplicate_creates_a_second_document(
+    member, db_session, route_storage
+):
+    first = _upload(member)
+    second = _upload(member, filename="copy.pdf", allow_duplicate=True)
+
+    assert first.status_code == 202, first.json()
+    assert second.status_code == 202, second.json()
+    assert second.json()["duplicate"] is False
+    assert second.json()["document_id"] != first.json()["document_id"]
+    assert len(route_storage.saved) == 2
+    assert len(_documents(db_session, member["workspace_id"])) == 2
+
+
+def test_same_checksum_in_another_workspace_is_a_new_document(
+    member, admin, db_session, route_storage
+):
+    first = _upload(member)
+    second = _upload(admin)
+
+    assert first.status_code == 202, first.json()
+    assert second.status_code == 202, second.json()
+    assert second.json()["duplicate"] is False
+    assert second.json()["document_id"] != first.json()["document_id"]
+    assert len(route_storage.saved) == 2
+    assert len(_documents(db_session, member["workspace_id"])) == 1
+    assert len(_documents(db_session, admin["workspace_id"])) == 1
+
+
+def test_duplicate_returns_an_existing_failed_document(
+    member, db_session, route_storage
+):
+    first = _upload(member)
+    document_id = uuid.UUID(first.json()["document_id"])
+    document = db_session.get(Document, document_id)
+    document.status = "failed"
+    db_session.flush()
+
+    second = _upload(member, filename="retry.pdf")
+
+    assert second.status_code == 200, second.json()
+    assert second.json()["document_id"] == str(document_id)
+    assert second.json()["status"] == "failed"
+    assert second.json()["duplicate"] is True
+    assert len(route_storage.saved) == 1
 
 
 # ---------------------------------------------------------------------------
@@ -305,7 +401,7 @@ def test_upload_strips_a_path_from_the_filename(member, db_session):
     ).scalar_one()
     assert "/" not in document.original_filename
     assert ".." not in document.original_filename
-    assert document.storage_key == "uploads/%s/original.pdf" % document_id
+    assert document.storage_key == storage_key_for(document_id)
 
 
 def test_upload_leaves_no_record_when_validation_fails(member, db_session):
@@ -314,6 +410,38 @@ def test_upload_leaves_no_record_when_validation_fails(member, db_session):
     _upload(member, content=b"nope", filename="bad.pdf")
     after = db_session.execute(select(Document)).scalars().all()
     assert len(after) == count_before
+
+
+def test_upload_storage_failure_returns_503(
+    member, db_session, route_storage, monkeypatch
+):
+    def fail_save(key, content):
+        raise StorageUnavailableError("simulated storage outage")
+
+    monkeypatch.setattr(route_storage, "save", fail_save)
+
+    r = _upload(member)
+
+    assert r.status_code == 503
+    assert r.json()["error"]["code"] == "DEPENDENCY_UNAVAILABLE"
+    assert r.json()["error"]["retryable"] is True
+    assert len(_documents(db_session, member["workspace_id"])) == 0
+
+
+def test_upload_path_error_returns_500(
+    member, db_session, route_storage, monkeypatch
+):
+    def fail_save(key, content):
+        raise StoragePathError("invalid storage key")
+
+    monkeypatch.setattr(route_storage, "save", fail_save)
+
+    r = _upload(member)
+
+    assert r.status_code == 500
+    assert r.json()["error"]["code"] == "INTERNAL_ERROR"
+    assert "invalid storage key" not in r.json()["error"]["message"]
+    assert len(_documents(db_session, member["workspace_id"])) == 0
 
 
 # ---------------------------------------------------------------------------
@@ -373,7 +501,8 @@ def test_list_filters_by_filename(member):
 
 def test_list_pagination_is_stable(member):
     for i in range(3):
-        _upload(member, filename="doc-%d.pdf" % i)
+        # Same bytes would deduplicate; this test is about pagination.
+        _upload(member, filename="doc-%d.pdf" % i, allow_duplicate=True)
     r = client.get("/api/v1/documents?limit=2&offset=0", headers=_auth(member))
     assert r.json()["total"] == 3
     assert len(r.json()["items"]) == 2
@@ -425,14 +554,16 @@ def test_get_document_rejects_a_malformed_id(member):
 # Download
 # ---------------------------------------------------------------------------
 
-def test_download_returns_the_bytes(member):
+def test_download_returns_the_bytes(member, route_storage):
     r = _upload(member)
-    document_id = r.json()["document_id"]
+    document_id = uuid.UUID(r.json()["document_id"])
+    key = storage_key_for(document_id)
 
     r2 = client.get("/api/v1/documents/%s/file" % document_id, headers=_auth(member))
     assert r2.status_code == 200
     assert r2.content == PDF_BYTES
     assert r2.headers["content-type"].startswith("application/pdf")
+    assert route_storage.reads == [key]
 
 
 def test_download_from_another_workspace_is_404(member, admin):
@@ -448,6 +579,49 @@ def test_download_requires_authentication(member):
     document_id = r.json()["document_id"]
     r2 = client.get("/api/v1/documents/%s/file" % document_id)
     assert r2.status_code == 401
+
+
+def test_download_missing_object_is_409(member, route_storage):
+    r = _upload(member)
+    document_id = uuid.UUID(r.json()["document_id"])
+    key = storage_key_for(document_id)
+    assert route_storage.delete(key) is True
+
+    r2 = client.get("/api/v1/documents/%s/file" % document_id, headers=_auth(member))
+
+    assert r2.status_code == 409
+    assert r2.json()["error"]["code"] == "INVALID_STATE"
+
+
+def test_download_storage_failure_is_503(member, route_storage, monkeypatch):
+    r = _upload(member)
+    document_id = r.json()["document_id"]
+
+    def fail_read(key):
+        raise StorageUnavailableError("simulated read outage")
+
+    monkeypatch.setattr(route_storage, "read", fail_read)
+
+    r2 = client.get("/api/v1/documents/%s/file" % document_id, headers=_auth(member))
+
+    assert r2.status_code == 503
+    assert r2.json()["error"]["code"] == "DEPENDENCY_UNAVAILABLE"
+    assert r2.json()["error"]["retryable"] is True
+
+
+def test_download_path_error_is_500(member, route_storage, monkeypatch):
+    r = _upload(member)
+    document_id = r.json()["document_id"]
+
+    def fail_read(key):
+        raise StoragePathError("invalid storage key")
+
+    monkeypatch.setattr(route_storage, "read", fail_read)
+
+    r2 = client.get("/api/v1/documents/%s/file" % document_id, headers=_auth(member))
+
+    assert r2.status_code == 500
+    assert r2.json()["error"]["code"] == "INTERNAL_ERROR"
 
 
 # ---------------------------------------------------------------------------
@@ -482,6 +656,7 @@ def test_retry_works_on_a_failed_document(member, db_session):
     )
     assert r2.status_code == 200
     assert r2.json()["status"] == "queued"
+    assert r2.json()["duplicate"] is False
 
     db_session.expire(document)
     assert document.status == "queued"
@@ -536,11 +711,13 @@ def test_delete_by_a_member_in_the_same_workspace_is_forbidden(shared_workspace)
     assert r2.json()["error"]["code"] == "FORBIDDEN"
 
 
-def test_delete_by_admin_removes_the_row_and_the_file(admin, db_session):
+def test_delete_by_admin_removes_the_row_and_the_file(
+    admin, db_session, route_storage
+):
     r = _upload(admin)
     document_id = uuid.UUID(r.json()["document_id"])
-    path = uploads.absolute_path("uploads/%s/original.pdf" % document_id)
-    assert path.exists()
+    key = storage_key_for(document_id)
+    assert route_storage.exists(key) is True
 
     r2 = client.delete("/api/v1/documents/%s" % document_id, headers=_auth(admin))
     assert r2.status_code == 204
@@ -549,7 +726,63 @@ def test_delete_by_admin_removes_the_row_and_the_file(admin, db_session):
         select(Document).where(Document.id == document_id)
     ).scalar_one_or_none()
     assert remaining is None
-    assert not path.exists()
+    assert route_storage.exists(key) is False
+    assert route_storage.deleted == [key]
+
+
+def test_delete_storage_failure_is_503_and_keeps_the_document(
+    admin, db_session, route_storage, monkeypatch
+):
+    r = _upload(admin)
+    document_id = uuid.UUID(r.json()["document_id"])
+    key = storage_key_for(document_id)
+
+    def fail_delete(key):
+        raise StorageUnavailableError("simulated delete outage")
+
+    monkeypatch.setattr(route_storage, "delete", fail_delete)
+
+    r2 = client.delete("/api/v1/documents/%s" % document_id, headers=_auth(admin))
+
+    assert r2.status_code == 503
+    assert r2.json()["error"]["code"] == "DEPENDENCY_UNAVAILABLE"
+    assert r2.json()["error"]["retryable"] is True
+    assert db_session.get(Document, document_id) is not None
+    assert route_storage.exists(key) is True
+
+
+def test_delete_path_error_is_500_and_keeps_the_document(
+    admin, db_session, route_storage, monkeypatch
+):
+    r = _upload(admin)
+    document_id = uuid.UUID(r.json()["document_id"])
+    key = storage_key_for(document_id)
+
+    def fail_delete(key):
+        raise StoragePathError("invalid storage key")
+
+    monkeypatch.setattr(route_storage, "delete", fail_delete)
+
+    r2 = client.delete("/api/v1/documents/%s" % document_id, headers=_auth(admin))
+
+    assert r2.status_code == 500
+    assert r2.json()["error"]["code"] == "INTERNAL_ERROR"
+    assert db_session.get(Document, document_id) is not None
+    assert route_storage.exists(key) is True
+
+
+def test_delete_missing_object_still_removes_the_row(
+    admin, db_session, route_storage
+):
+    r = _upload(admin)
+    document_id = uuid.UUID(r.json()["document_id"])
+    key = storage_key_for(document_id)
+    assert route_storage.delete(key) is True
+
+    r2 = client.delete("/api/v1/documents/%s" % document_id, headers=_auth(admin))
+
+    assert r2.status_code == 204
+    assert db_session.get(Document, document_id) is None
 
 
 def test_delete_is_blocked_while_processing(admin, db_session):

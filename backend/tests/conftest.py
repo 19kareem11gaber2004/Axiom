@@ -61,3 +61,54 @@ def db_session():
         session.close()
         outer_transaction.rollback()
         connection.close()
+
+
+# ---------------------------------------------------------------------------
+# Storage adapters
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def local_storage(tmp_path):
+    """A LocalFileStorage rooted in a unique temporary directory.
+
+    The root is deliberately not ``backend/storage``: storage tests must
+    never create objects in the repository working tree.
+    """
+    from app.storage.local import LocalFileStorage
+
+    return LocalFileStorage(tmp_path / "storage")
+
+
+@pytest.fixture
+def memory_storage():
+    """A fresh in-memory storage adapter for one test."""
+    from tests.fakes.storage import InMemoryFileStorage
+
+    return InMemoryFileStorage()
+
+
+@pytest.fixture(params=["local", "memory"])
+def storage_adapter(request, local_storage, memory_storage):
+    """Run a test against both implementations of the storage contract."""
+    if request.param == "local":
+        return local_storage
+    if request.param == "memory":
+        return memory_storage
+    raise AssertionError("Unknown storage adapter %r" % request.param)
+
+
+@pytest.fixture
+def override_storage(storage_adapter):
+    """Install a storage adapter in FastAPI's dependency map, then restore.
+
+    The override is isolated per test so route tests can choose either the
+    local adapter or the in-memory fake without leaking state.
+    """
+    from app.main import app
+    from app.storage import get_storage
+
+    app.dependency_overrides[get_storage] = lambda: storage_adapter
+    try:
+        yield storage_adapter
+    finally:
+        app.dependency_overrides.pop(get_storage, None)

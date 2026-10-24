@@ -5,6 +5,8 @@
 > **How to use it.** Read §1–§3 first (the story). Then read the code in the order given in §11. Every section names the exact file and function so you can follow along in your editor. When you want to *prove* that you understand it, work through the six exercises in §14.
 >
 > The operational README stays in `README.md` (how to install and run). This one is about *why*.
+>
+> **Phase 3 update (2026-10-23).** The storage and upload code described below now lives in `app/storage/base.py`, `app/storage/local.py`, `app/storage/keys.py`, and `app/ingestion/service.py`; the former local upload helper was removed. See `docs/phase-3/README3.md` for the current ingestion contract.
 
 ---
 
@@ -33,7 +35,7 @@ Those two problems — **who may see what**, and **what is actually true right n
 
 | Before Phase 1 ended | After Phase 2 |
 |---|---|
-| 2 endpoints (`/health`, `/ready`) | 10 versioned endpoints under `/api/v1` |
+| 2 endpoints (`/health`, `/ready`) | 13 versioned operations across 10 paths under `/api/v1` |
 | No identity at all | JWT bearer tokens, 4 workspace roles |
 | No tenant boundary | `workspace_id` on every table + composite foreign keys |
 | 9 tables, no API to reach them | full document lifecycle: upload → list → read → download → retry → delete |
@@ -42,7 +44,7 @@ Those two problems — **who may see what**, and **what is actually true right n
 | Unlimited login attempts | Redis-backed rate limiting, per account and per IP |
 | A worker container that exited with `ModuleNotFoundError` | a worker that connects to the broker and waits for work |
 | Requests that could hang for minutes on an unreachable database | every connection attempt and every pool wait is bounded |
-| 0 application tests | 226 tests against a real PostgreSQL and a real Redis |
+| 0 application tests | 226 tests at Phase 2 close; 351 today, against a real PostgreSQL and a real Redis |
 
 ---
 
@@ -302,7 +304,7 @@ def delete_document(
 
 **Why the resource is resolved *before* the role is checked.** A document in another workspace must answer `404`, not `403`. A `403` would *confirm the id exists*. So the order is: resolve the resource (404), then check the role (403), then check the state (409). The response therefore depends on the **resource**, not on who is asking.
 
-**`app/storage/uploads.py` and `app/ingestion/validation.py`** handle uploads. The file goes to `storage/uploads/{document_id}/original.pdf` and the row is written in the same request — the `202` is only returned after **both** are durable. The user's filename is never used to build a path (it is normalised and sanitised), so a filename like `../../etc/passwd.pdf` cannot escape the storage directory.
+**`app/ingestion/service.py`, `app/storage/base.py`, `app/storage/local.py`, and `app/ingestion/validation.py`** handle uploads. The file goes to `storage/uploads/{document_id}/original.pdf` through the `FileStorage` port; the row is written in the same request, and the `202` is only returned after **both** are durable. The user's filename is never used to build a path (it is normalised and sanitised), so a filename like `../../etc/passwd.pdf` cannot escape the storage directory. Phase 3 adds workspace-scoped SHA-256 deduplication and returns `200` with an existing document when the bytes already exist in that workspace.
 
 **`app/auth/bootstrap.py`** creates the very first administrator, because there is no public registration: adding members requires an admin, and initially there is none. It refuses to run when the database already has users, so it can never mint a second administrator unnoticed.
 
@@ -433,7 +435,7 @@ The server must answer with `Access-Control-Allow-Origin` **and** list `x-worksp
 | Two API servers sharing port 8000 | The API is published on `127.0.0.1` and the rule is documented | `docker-compose.yml`, `docker-compose.host-dev.yml` |
 | Passwords stolen from a database dump | bcrypt hashes, never plaintext | `hash_password` |
 | Finding which emails exist | Identical response and timing for unknown email and wrong password | `authenticate_user` |
-| Path traversal via a filename | Filename never builds a path; storage key is `{document_id}` | `app/storage/uploads.py` |
+| Path traversal via a filename | Filename never builds a path; the key is `uploads/{document_id}/original.pdf` | `app/storage/keys.py`, `app/storage/local.py` |
 | A malicious PDF instructing the model | (Phase 5 — retrieved text is treated as evidence, not instructions) | not yet |
 | Internal details leaking to the client | One error envelope; the catch-all logs details and returns a generic message | `app/api/errors.py` |
 | A browser site calling the API | CORS restricted to configured origins | `app/main.py` |
@@ -660,7 +662,7 @@ Being honest about the boundary of this phase:
 - **Tokens cannot be revoked.** `POST /auth/logout` cannot invalidate a token — the server keeps no list. The client discards it. A token also stops working when it expires, and any change to the account takes effect immediately.
 - **No refresh tokens.** Access tokens last 30 minutes and then you log in again.
 - **No `audit_logs` table.** Document deletion writes a structured log line; the permanent audit trail is Phase 10.
-- **Files are on local disk.** The `FileStorage` abstraction that allows an object store arrives in Phase 3.
+- **Files are on local disk.** The `FileStorage` port and `LocalFileStorage` now exist (Phase 3), but an object-store adapter is still future work.
 - **Only PDF, and only a signature check.** `%PDF-` at the start. Page counts, character limits and timeouts arrive with the worker.
 
 ---
@@ -864,8 +866,8 @@ docker compose run --rm api sh -c "pip install --no-cache-dir -r requirements-de
 
 ## 15. Where to go next
 
-- **Phase 3 — Document Ingestion.** The `FileStorage` abstraction, checksum deduplication, and the upload lifecycle.
-- **Phase 4 — Background Processing.** The Celery worker, the database claim, the sweeper, and retries. This is where `queued` documents start becoming `indexed`.
+- **Phase 3 — Document Ingestion (completed).** The `FileStorage` port and local adapter, workspace-scoped SHA-256 deduplication, the upload lifecycle, and shared API/worker storage. See `docs/phase-3/README3.md`.
+- **Phase 4 — Background Processing (next).** The Celery worker, the database claim, the sweeper, and retries. This is where `queued` documents start becoming `indexed`.
 - **Phase 5 — PDF RAG MVP.** Parsing, chunking, embeddings, retrieval, cited answers and honest abstention.
 
 The design documents that back all of this live in `docs/phase-1/`:

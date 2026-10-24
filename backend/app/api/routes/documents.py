@@ -17,7 +17,12 @@ from fastapi import APIRouter, Depends, File, Response, UploadFile, status
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
-from app.api.errors import ConflictError, NotFoundError, ValidationError
+from app.api.errors import (
+    ConflictError,
+    DependencyUnavailableError,
+    NotFoundError,
+    ValidationError,
+)
 from app.api.schemas import (
     DocumentListItem,
     DocumentListResponse,
@@ -30,12 +35,16 @@ from app.auth.dependencies import (
     get_current_membership,
     require_role,
 )
-from app.config import settings
 from app.db.models import Document
 from app.db.session import get_db
-from app.ingestion.validation import InvalidUploadError, normalise_filename
-from app.ingestion.validation import validate_pdf_upload
-from app.storage import uploads
+from app.ingestion.service import ingest_upload
+from app.ingestion.validation import InvalidUploadError
+from app.storage import (
+    FileStorage,
+    StorageNotFoundError,
+    StorageUnavailableError,
+    get_storage,
+)
 
 logger = logging.getLogger("axiom.documents")
 
@@ -110,73 +119,69 @@ def _load_document(
     "",
     response_model=DocumentUploadResponse,
     status_code=status.HTTP_202_ACCEPTED,
+    responses={
+        status.HTTP_200_OK: {
+            "model": DocumentUploadResponse,
+            "description": (
+                "Duplicate upload; the existing document is returned."
+            ),
+        },
+        status.HTTP_202_ACCEPTED: {
+            "model": DocumentUploadResponse,
+            "description": (
+                "New document stored and queued for processing."
+            ),
+        },
+    },
 )
 def upload_document(
+    response: Response,
+    allow_duplicate: bool = False,
     file: UploadFile = File(...),
     membership: CurrentMembership = Depends(require_role(*UPLOAD_ROLE)),
     db: Session = Depends(get_db),
+    storage: FileStorage = Depends(get_storage),
 ):
     """Accept a PDF for background processing.
 
-    The 202 is returned only after the file has been written and the
-    document row has been committed. Processing and indexing happen later
-    in the worker (Phase 4); until then the document stays "queued".
+    A new document is stored and committed as "queued", then answered with
+    202. If the workspace already contains the same checksum, the existing
+    document is returned with 200 and ``duplicate=true``. Passing
+    ``allow_duplicate=true`` creates a second document instead.
 
-    The response is 202 Accepted rather than 200 Created because the
-    document is not searchable yet.
+    The ingestion service owns validation, deduplication, storage and the
+    single commit. This route only maps its domain errors onto HTTP.
     """
-    filename = normalise_filename(file.filename)
-
-    # Reject an oversized file before reading it into memory.
-    if file.size is not None and file.size > settings.max_upload_bytes:
-        raise ValidationError(
-            "The file is larger than the %d byte limit." % settings.max_upload_bytes
-        )
-
-    content = file.file.read()
-
     try:
-        validate_pdf_upload(filename, content, settings.max_upload_bytes)
+        result = ingest_upload(
+            db,
+            membership.workspace_id,
+            membership.user.id,
+            file.filename,
+            file.file,
+            allow_duplicate=allow_duplicate,
+            storage=storage,
+        )
     except InvalidUploadError as exc:
         raise ValidationError(str(exc)) from exc
+    except StorageUnavailableError as exc:
+        logger.error(
+            "Storage unavailable while uploading to workspace %s",
+            membership.workspace_id,
+            exc_info=True,
+        )
+        raise DependencyUnavailableError(
+            "Storage is temporarily unavailable; the upload was not accepted."
+        ) from exc
 
-    document = Document(
-        workspace_id=membership.workspace_id,
-        uploaded_by=membership.user.id,
-        original_filename=filename,
-        storage_key="",  # filled in below, once the id exists
-        mime_type="application/pdf",
-        size_bytes=len(content),
-        checksum=uploads.checksum_of(content),
-        status="uploaded",
+    response.status_code = (
+        status.HTTP_200_OK if result.duplicate else status.HTTP_202_ACCEPTED
     )
-    db.add(document)
-    db.flush()  # assigns document.id
-
-    document.storage_key = uploads.storage_key_for(document.id)
-
-    try:
-        uploads.save_upload(document.id, content)
-    except OSError as exc:
-        db.rollback()
-        logger.error("Failed to store upload for document %s", document.id)
-        raise ValidationError("The file could not be stored.") from exc
-
-    # The row is only promoted to "queued" once the file is safely on
-    # disk, so a queued document always has its file available.
-    document.status = "queued"
-    document.updated_at = func.now()
-    db.commit()
-    db.refresh(document)
-
-    logger.info(
-        "Document %s uploaded to workspace %s (%d bytes)",
-        document.id,
-        document.workspace_id,
-        document.size_bytes,
+    return DocumentUploadResponse(
+        document_id=result.document.id,
+        status=result.document.status,
+        duplicate=result.duplicate,
     )
-
-    return DocumentUploadResponse(document_id=document.id, status=document.status)
 
 
 @router.get("", response_model=DocumentListResponse)
@@ -237,6 +242,7 @@ def download_document(
     document_id: uuid.UUID,
     membership: CurrentMembership = Depends(get_current_membership),
     db: Session = Depends(get_db),
+    storage: FileStorage = Depends(get_storage),
 ):
     """Download the original file.
 
@@ -250,10 +256,19 @@ def download_document(
         raise ConflictError("The document is not ready for download yet.")
 
     try:
-        content = uploads.read_upload(document.storage_key)
-    except (OSError, ValueError) as exc:
-        logger.error("Stored file for document %s is unreadable", document.id)
-        raise ConflictError("The stored file could not be read.") from exc
+        content = storage.read(document.storage_key)
+    except StorageNotFoundError as exc:
+        logger.error("Stored file for document %s is missing", document.id)
+        raise ConflictError("The stored file is missing.") from exc
+    except StorageUnavailableError as exc:
+        logger.error(
+            "Storage unavailable while downloading document %s",
+            document.id,
+            exc_info=True,
+        )
+        raise DependencyUnavailableError(
+            "Storage is temporarily unavailable; the file could not be read."
+        ) from exc
 
     return Response(
         content=content,
@@ -303,11 +318,19 @@ def delete_document(
     document_id: uuid.UUID,
     membership: CurrentMembership = Depends(get_current_membership),
     db: Session = Depends(get_db),
+    storage: FileStorage = Depends(get_storage),
 ):
     """Delete a document, its file, and its derived data.
 
     Conversation history is not affected: citations keep their own
     snapshot of the passage text, so past answers stay readable.
+
+    The storage object is removed inside the database transaction's
+    window: the row delete is flushed first, then the object is removed,
+    then the transaction commits. A storage outage rolls the row deletion
+    back. The two systems cannot be perfectly atomic, so if the file is
+    removed and the commit then fails, the row remains and a retry safely
+    completes the delete (a missing object is idempotent).
     """
     document = _load_document(db, document_id, membership)
     ensure_role(membership, *DELETE_ROLE)
@@ -317,17 +340,34 @@ def delete_document(
             "A document that is being processed cannot be deleted."
         )
 
+    document_id = document.id
     storage_key = document.storage_key
 
-    # Remove the row first. chunks and processing_runs are removed by the
-    # ON DELETE CASCADE constraints; citations keep their snapshots.
-    db.delete(document)
-    db.commit()
+    try:
+        # chunks and processing_runs are removed by the ON DELETE CASCADE
+        # constraints; citations keep their snapshots.
+        db.delete(document)
+        db.flush()
+        removed = storage.delete(storage_key)
+        db.commit()
+    except StorageUnavailableError as exc:
+        db.rollback()
+        logger.error(
+            "Storage unavailable while deleting document %s",
+            document_id,
+            exc_info=True,
+        )
+        raise DependencyUnavailableError(
+            "Storage is temporarily unavailable; the document was not deleted."
+        ) from exc
+    except Exception:
+        db.rollback()
+        logger.exception("Failed to delete document %s", document_id)
+        raise
 
-    removed = uploads.delete_upload(storage_key)
     logger.info(
         "Document %s deleted by user %s (file removed: %s)",
-        document.id,
+        document_id,
         membership.user.id,
         removed,
     )

@@ -35,6 +35,10 @@ x-app-environment: &app-environment
   ENV: ${AXIOM_ENV:-dev}
   JWT_SECRET_KEY: ${AXIOM_JWT_SECRET_KEY:-dev-only-insecure-jwt-secret-change-me}
   LOGIN_RATE_LIMIT_FAILURE_MODE: ${AXIOM_LOGIN_RATE_LIMIT_FAILURE_MODE:-open}
+  # The API writes uploads here and the worker reads them. Both services
+  # receive the same host bind mount at this path (see the api and worker
+  # volumes below), so a document written by one is visible to the other.
+  STORAGE_ROOT: /srv/backend/storage
 
 services:
   postgres:
@@ -65,6 +69,10 @@ services:
   api:
     build: ./backend
     environment: *app-environment
+    volumes:
+      # Shared document storage. This is a bind mount, not a named volume,
+      # so `docker compose down -v` does not delete uploaded files.
+      - ./backend/storage:/srv/backend/storage
     ports:
       # Bound to the loopback interface: the API is a development server
       # and must not be reachable from the local network.
@@ -89,6 +97,10 @@ services:
   worker:
     build: ./backend
     environment: *app-environment
+    volumes:
+      # The same host directory as the api service: the worker can read
+      # the object the API stored for a queued document.
+      - ./backend/storage:/srv/backend/storage
     command: ["celery", "-A", "app.worker.celery_app", "worker", "--loglevel=info"]
     depends_on:
       postgres:

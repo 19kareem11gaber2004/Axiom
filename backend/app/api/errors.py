@@ -134,9 +134,9 @@ class DependencyUnavailableError(AxiomError):
     """A required dependency is unavailable, so the request was not carried out.
 
     This is used when the login rate limiter cannot reach Redis and the
-    deployment is configured to fail closed. The request is refused with
-    503 rather than 429: the caller did nothing wrong, and a 429 would
-    wrongly suggest that it should back off and retry later.
+    deployment is configured to fail closed, and when the storage backend
+    cannot complete a required read or write. The request is refused with
+    503: the caller did nothing wrong, and the operation is safe to retry.
     """
 
     def __init__(

@@ -24,7 +24,7 @@ must still pick up the same ``.env``.
 
 from pathlib import Path
 
-from pydantic import model_validator
+from pydantic import field_validator, model_validator
 from pydantic_settings import BaseSettings
 
 # Development-only fallback secret. It exists so a fresh clone can start
@@ -79,7 +79,11 @@ class Settings(BaseSettings):
     # safer but makes login deliberately expensive.
     bcrypt_rounds: int = 12
 
-    # --- Uploads (Phase 2, step 2.5) ---
+    # --- Uploads and storage (Phase 2 step 2.5, Phase 3) ---
+    # Which FileStorage adapter the application uses. Phase 3 implements
+    # only "local". An unknown value is rejected at startup instead of
+    # silently falling back to the local filesystem.
+    storage_backend: str = "local"
     # Root directory for uploaded files. A relative path is resolved
     # against the backend package directory.
     storage_root: str = "storage"
@@ -145,6 +149,22 @@ class Settings(BaseSettings):
                 "ENV is not 'dev'."
             )
         return self
+
+    @field_validator("storage_backend")
+    @classmethod
+    def _validate_storage_backend(cls, value: str) -> str:
+        """Reject a storage backend the application cannot provide.
+
+        A typo in STORAGE_BACKEND must not silently select local disk:
+        the operator asked for a particular backend and needs to know
+        immediately that it is unavailable.
+        """
+        backend = value.strip().lower()
+        if backend != "local":
+            raise ValueError(
+                "STORAGE_BACKEND must be 'local', got %r." % value
+            )
+        return backend
 
     @model_validator(mode="after")
     def _validate_failure_mode(self) -> "Settings":

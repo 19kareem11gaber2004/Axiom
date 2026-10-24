@@ -25,6 +25,7 @@ from app.api.routes import documents as document_routes
 from app.api.routes import workspaces as workspace_routes
 from app.auth import rate_limit
 from app.config import settings
+from app.storage import get_storage
 
 logger = logging.getLogger("axiom.main")
 
@@ -59,8 +60,8 @@ def configure_logging() -> None:
     the terminal through logging's "last resort" handler: warnings, in a
     bare line, and nothing at all at INFO level. The startup summary in
     particular has to be visible - it is how an operator sees which
-    database, which Redis and which rate-limit posture the process
-    actually uses.
+    database, which Redis, which storage backend and which rate-limit
+    posture the process actually uses.
     """
     app_logger = logging.getLogger("axiom")
     if not app_logger.handlers:
@@ -80,16 +81,22 @@ async def lifespan(app: FastAPI):
     """Report the effective configuration and clean up on shutdown.
 
     The configuration is logged without secrets: only the hosts the
-    process talks to, the environment name, and the rate-limit failure
-    mode. The JWT secret and the database password are never logged.
+    process talks to, the environment name, the rate-limit failure mode,
+    and the selected storage backend and root. The JWT secret and the
+    database password are never logged.
     """
     configure_logging()
+    storage = get_storage()
+    storage_root = getattr(storage, "root", "<adapter-defined>")
     logger.info(
         "Starting Axiom API in the %s environment. "
-        "PostgreSQL=%s Redis=%s rate-limit-failure-mode=%s",
+        "PostgreSQL=%s Redis=%s storage-backend=%s storage-root=%s "
+        "rate-limit-failure-mode=%s",
         settings.env,
         _database_target(),
         _redis_target(),
+        settings.storage_backend,
+        storage_root,
         settings.login_rate_limit_failure_mode,
     )
     try:

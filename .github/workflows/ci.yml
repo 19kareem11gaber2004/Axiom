@@ -64,9 +64,28 @@ jobs:
         # configuration the Compose file gives it, and that it reaches
         # PostgreSQL and Redis over the Compose network.
         run: |
+          # Create the bind-mount source as the runner user. If Compose
+          # creates it instead, Docker owns the host directory as root.
+          mkdir -p backend/storage
           docker compose up -d --wait --wait-timeout 180 api worker
           docker compose logs worker 2>&1 | grep -E "ready\."
           curl -fsS http://127.0.0.1:8000/ready
+
+      - name: Verify the API and worker share storage
+        # A file written by the API must be readable by the worker, which
+        # runs as a different uid. This catches a missing or divergent bind
+        # mount before the worker is asked to process an upload.
+        run: |
+          cleanup() {
+            docker compose exec -T api rm -f /srv/backend/storage/.compose-smoke >/dev/null 2>&1 || true
+          }
+          trap cleanup EXIT
+
+          docker compose exec -T api sh -c 'test "$STORAGE_ROOT" = /srv/backend/storage'
+          docker compose exec -T worker sh -c 'test "$STORAGE_ROOT" = /srv/backend/storage'
+
+          docker compose exec -T api sh -c 'printf "shared-storage" > /srv/backend/storage/.compose-smoke'
+          test "$(docker compose exec -T worker cat /srv/backend/storage/.compose-smoke)" = "shared-storage"
 
       - name: Stop the containers
         run: docker compose down

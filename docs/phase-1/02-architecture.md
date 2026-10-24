@@ -64,7 +64,10 @@ Violations fail review; enforced by import lints from Phase 2.
 
 ## Request flows
 
-Upload: `UI → POST /documents → api validates → storage.save → db(doc=uploaded) → db(doc=queued)+enqueue → 202 {document_id}`.
+Upload (Phase 3, implemented): `UI → POST /documents → api validates + hashes → duplicate? → 200 existing : storage.save → db INSERT status=queued → commit → 202 {document_id}`. There is no broker publish in Phase 3.
+
+Upload (Phase 4 target): `… storage.save → db(doc=uploaded) → publish → db(doc=queued) → 202`, with the sweeper recovering a committed `uploaded` row whose publish failed.
+
 Worker: `claim (UPDATE...WHERE RETURNING) → storage.open → ingest → embed → db chunks+indexed in one txn`.
 Chat: `POST /chat → auth scope → retrieval (workspace_id filter) → ai_workflow generate+validate citations → trace row → answer`.
 

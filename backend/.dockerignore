@@ -1,0 +1,9 @@
+# Runtime uploads are bind-mounted at /srv/backend/storage. They must
+# never be copied into the image during `docker compose build`.
+storage/
+
+# Local development and test artifacts.
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.env

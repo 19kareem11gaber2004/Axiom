@@ -53,7 +53,7 @@ ENUM note: `document_status`, `membership_role` and `message_role` are native Po
 
 Goal: deleting a document removes the file and index but never deletes conversation history (US-07 + audit).
 
-- `DELETE /documents/{id}` (admin+, terminal/cancellable states only — see §6) runs one transaction: delete storage object + `DELETE FROM documents WHERE id AND workspace_id`. Cascades remove `chunks` and `processing_runs` automatically. No worker may re-insert after this (guarded commit, §6).
+- `DELETE /documents/{id}` (admin+, terminal/cancellable states only — see §6) flushes the scoped `DELETE FROM documents WHERE id AND workspace_id`, removes the storage object, then commits. Cascades remove `chunks` and `processing_runs` automatically. A storage outage rolls the row deletion back and returns `503`; a missing object is idempotent. No worker may re-insert after this (guarded commit, §6).
 - `citations.document_id` has NO foreign key, so deletion is never blocked and history is never cascade-deleted. Each citation already stores `document_id` (value), `original_filename`, `page_number`, and `passage_text`; all remain readable after deletion.
 - `citations.chunk_id → chunks(id) ON DELETE SET NULL`: live citations can join the chunk; after deletion or re-index the id NULLs out but the snapshot (`passage_text`, page, filename) stays valid.
 - `citations → messages ON DELETE CASCADE`: citations die only with their own conversation (message/conversation delete), never with the source document.
@@ -151,20 +151,45 @@ Provisioning: Axiom has **no public registration**. The only path that creates a
 
 **Login rate limiting (step 2.7).** Redis counts *failures*, not attempts, so a user who mistypes once is not punished; a successful login clears the counter. Two limits apply: per account (5 failures / 60 s) and per source IP (30 failures / 60 s, higher because many users share one address). The window is fixed — the TTL starts at the first failure. If Redis is unreachable the limiter **fails open** and logs a warning: failing closed would turn a Redis outage into a total login outage, and the credential check still applies either way. `X-Forwarded-For` is deliberately not trusted, because a client could otherwise spoof it to escape the per-IP limit.
 
-### 8.2 Documents (Phase 2, step 2.5, implemented)
+### 8.2 Documents (Phase 2 API + Phase 3 ingestion, implemented)
 
-Uploads are accepted as PDF only. The file is written to `<storage_root>/uploads/{document_id}/original.pdf` and the row is created in the same request; the `202` is returned only after **both** are durable. The `FileStorage` abstraction is deferred to Phase 3, but the on-disk layout is already fixed here so Phase 3 only extracts the interface.
+Uploads are accepted as PDF only. The file is written through the `FileStorage` port to `<storage_root>/uploads/{document_id}/original.pdf`; the row is created in the same request; the `202` is returned only after **both** the bytes and the row are durable. The path is built from the server-generated document id, never from the user's filename. Phase 3 implements the upload contract below. No Alembic migration is required: the existing `documents.checksum` column and non-unique `(workspace_id, checksum)` index carry deduplication.
 
 | Method | Endpoint | Role | Success | Errors | Scoping / state |
 |---|---|---|---|---|---|
-| `POST` | `/documents` (multipart PDF) | member+ | `202 {document_id, status:'queued'}` | `400 VALIDATION_ERROR` (not a PDF, empty, too large), `401`, `403` | `workspace_id` from membership; file written before the row is committed |
+| `POST` | `/documents` (multipart PDF, optional `?allow_duplicate=true`) | member+ | `202 {document_id, status:'queued', duplicate:false}`; `200 {document_id, status, duplicate:true}` on a duplicate | `400 VALIDATION_ERROR` (not a PDF, empty, too large), `401`, `403`, `503 DEPENDENCY_UNAVAILABLE` (storage write failed) | `workspace_id` from membership; file written before the row is committed; dedup is workspace-scoped (see below) |
 | `GET` | `/documents?status_filter=&q=&limit=&offset=` | viewer+ | `200 {items, total}` ordered `(created_at,id)` | `401`, `403` | workspace-filtered in SQL; `q` matches filename only; limit 20 default / 100 max |
 | `GET` | `/documents/{id}` | viewer+ | `200` metadata+status+error | `401`, `404` (incl. other-workspace ids) | membership-checked |
-| `GET` | `/documents/{id}/file` | viewer+ | `200` file stream | `401`, `404`, `409` (still `uploaded`) | the only authorized path to the bytes; no local path is exposed |
+| `GET` | `/documents/{id}/file` | viewer+ | `200` file stream | `401`, `404`, `409 INVALID_STATE` (status `uploaded` or stored object missing), `503 DEPENDENCY_UNAVAILABLE` | the only authorized path to the bytes; no local path is exposed |
 | `POST` | `/documents/{id}/retry` | member+ | `200 {document_id, status:'queued'}` | `401`, `404`, `409 INVALID_STATE` (not `failed`), `403` | clears the error, `attempts+1`; permanent-vs-transient split arrives with Phase 4 |
-| `DELETE` | `/documents/{id}` | admin+ | `204` | `401`, `404`, `409 INVALID_STATE` (in `processing/retrying`), `403` | file + row removed; chunks/runs cascade; citations keep their snapshots |
+| `DELETE` | `/documents/{id}` | admin+ | `204` | `401`, `404`, `409 INVALID_STATE` (in `processing/retrying`), `403`, `503 DEPENDENCY_UNAVAILABLE` (storage delete failed; the row deletion rolls back) | file + row removed; chunks/runs cascade; citations keep their snapshots |
 
 Ordering rule for single-document routes: the **resource is resolved before the role is checked**, so a document in another workspace always answers `404` no matter which role the caller holds. A `403` would confirm that the id exists.
+
+Storage access goes through `app/storage/base.py`; the API routes and the worker never import `pathlib`, `open`, or `shutil`. Keys are server-generated POSIX paths (`uploads/{document_id}/original.pdf`), and `LocalFileStorage` writes atomically with a temporary file, `fsync`, and `os.replace`. Compose gives both the API and worker the same bind-mounted `STORAGE_ROOT` (`/srv/backend/storage`), which is what makes the Phase 4 read path possible.
+
+#### Phase 3 upload contract (implemented)
+
+Phase 3 keeps the existing `POST /documents` shape and adds workspace-scoped checksum deduplication:
+
+| Case | Success | Behaviour |
+|---|---|---|
+| New content | `202 {document_id, status:'queued', duplicate:false}` | The file is stored first, then the row is committed as `queued` |
+| Same checksum in the caller's workspace | `200 {document_id: existing_id, status: existing_status, duplicate:true}` | No new row and no new file; the existing document's metadata (filename, uploader, timestamps) is unchanged |
+| Same checksum, `?allow_duplicate=true` | `202 {document_id: new_id, status:'queued', duplicate:false}` | Intentional re-upload; a second document and file are created |
+| Same checksum in another workspace | `202` with a new document | Dedup is workspace-scoped; another workspace's id is never returned |
+| Existing match is `failed` | `200` with `status:'failed', duplicate:true` | The caller may retry it or force a new upload |
+| Multiple matches | `200` with the healthiest match | Priority: `indexed` > `queued`/`processing`/`retrying` > `uploaded` > `failed`; newest first within a tier |
+
+Rules:
+
+- Dedup is **advisory, not a uniqueness guarantee**. The `(workspace_id, checksum)` index stays non-unique so intentional re-uploads remain possible; concurrent identical uploads can both create a document.
+- A duplicate is a successful lookup, not an error: it does not create work and it does not modify the existing row. The `duplicate` flag is part of the response schema.
+- The upload uses a single commit after the file is durable. If the database insert or commit fails, the service rolls back and makes a best-effort attempt to delete the just-written object. A process crash between the file write and the commit can leave an unreferenced object; there is no orphan-file collector in Phase 3.
+- A validation failure remains `400 VALIDATION_ERROR`; a storage I/O failure is `503 DEPENDENCY_UNAVAILABLE`; a missing stored object on download is `409 INVALID_STATE`.
+- Delete flushes the row deletion, removes the storage object, then commits. A storage outage rolls the row deletion back and returns `503`; a missing object is idempotent and the row is still deleted.
+- The upload endpoint reads at most `max_upload_bytes + 1` bytes, so an absent or incorrect `UploadFile.size` cannot force an unbounded read.
+- The actual broker publish, the durable `uploaded` state, and the sweeper remain Phase 4. Phase 3 commits directly to `queued` after the bytes and row are durable.
 
 ### 8.3 Browser access (CORS, step 2.6, implemented)
 
