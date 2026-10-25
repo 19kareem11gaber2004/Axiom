@@ -178,3 +178,33 @@ def test_each_upload_response_documents_duplicate(schema, code):
 
     assert "duplicate" in response_schema["properties"]
     assert response_schema["properties"]["duplicate"]["default"] is False
+
+
+# ---------------------------------------------------------------------------
+# Phase 4 document state
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize(
+    "schema_name", ["DocumentRead", "DocumentListItem"]
+)
+def test_document_schemas_expose_retryable(schema, schema_name):
+    properties = schema["components"]["schemas"][schema_name]["properties"]
+
+    assert properties["retryable"]["type"] == "boolean"
+    assert properties["retryable"]["default"] is False
+
+
+def test_the_phase4_document_fields_do_not_change_the_endpoint_count(schema):
+    api_paths = {
+        path for path in schema["paths"] if path.startswith("/api/v1/")
+    }
+    operations = [
+        (path, method)
+        for path, item in schema["paths"].items()
+        if path.startswith("/api/v1/")
+        for method in item
+        if method in ("get", "post", "put", "patch", "delete")
+    ]
+
+    assert len(api_paths) == 10
+    assert len(operations) == 13

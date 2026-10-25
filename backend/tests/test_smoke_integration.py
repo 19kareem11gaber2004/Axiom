@@ -80,7 +80,7 @@ def test_alembic_revision_is_applied(pg_conn):
         cur.execute("SELECT version_num FROM alembic_version")
         row = cur.fetchone()
     assert row is not None, "alembic_version is empty - run 'alembic upgrade head'"
-    assert row[0] == "0001", f"expected revision 0001, found {row[0]}"
+    assert row[0] == "0002", f"expected revision 0002, found {row[0]}"
 
 
 def test_enum_types_exist_once(pg_conn):

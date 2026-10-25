@@ -76,6 +76,7 @@ def _to_read(document: Document) -> DocumentRead:
         processing_attempts=document.processing_attempts,
         error_code=document.error_code,
         error_message=document.error_message,
+        retryable=document.retryable,
         created_at=document.created_at,
         updated_at=document.updated_at,
         indexed_at=document.indexed_at,
@@ -89,6 +90,7 @@ def _to_list_item(document: Document) -> DocumentListItem:
         status=document.status,
         processing_attempts=document.processing_attempts,
         error_code=document.error_code,
+        retryable=document.retryable,
         created_at=document.created_at,
     )
 

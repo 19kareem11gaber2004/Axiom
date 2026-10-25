@@ -162,6 +162,7 @@ class DocumentRead(BaseModel):
     processing_attempts: int
     error_code: Optional[str] = None
     error_message: Optional[str] = None
+    retryable: bool = False
     created_at: datetime
     updated_at: datetime
     indexed_at: Optional[datetime] = None
@@ -177,6 +178,7 @@ class DocumentListItem(BaseModel):
     status: str
     processing_attempts: int
     error_code: Optional[str] = None
+    retryable: bool = False
     created_at: datetime
 
 

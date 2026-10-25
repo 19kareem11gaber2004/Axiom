@@ -28,8 +28,9 @@ import re
 import pytest
 from alembic import command
 from alembic.config import Config
+from sqlalchemy import Boolean
 
-from app.db.models import DocumentStatus, MembershipRole, MessageRole
+from app.db.models import Document, DocumentStatus, MembershipRole, MessageRole
 
 BACKEND_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -44,6 +45,17 @@ def migration_sql() -> str:
     buffer = io.StringIO()
     config.output_buffer = buffer
     command.upgrade(config, "head", sql=True)
+    return buffer.getvalue()
+
+
+@pytest.fixture(scope="module")
+def downgrade_sql() -> str:
+    """Render the 0002 -> 0001 downgrade without touching a database."""
+    config = Config(os.path.join(BACKEND_DIR, "alembic.ini"))
+    config.set_main_option("script_location", os.path.join(BACKEND_DIR, "alembic"))
+    buffer = io.StringIO()
+    config.output_buffer = buffer
+    command.downgrade(config, "head:0001", sql=True)
     return buffer.getvalue()
 
 
@@ -124,6 +136,40 @@ def test_enum_columns_reference_the_created_types(migration_sql: str):
 def test_pgvector_setup_is_preserved(migration_sql: str):
     assert "CREATE EXTENSION IF NOT EXISTS vector" in migration_sql
     assert re.search(r"embedding VECTOR\(768\) NOT NULL", migration_sql)
+
+
+def test_retryable_column_is_added_with_a_false_default(migration_sql: str):
+    assert (
+        "ALTER TABLE documents ADD COLUMN retryable "
+        "BOOLEAN DEFAULT false NOT NULL"
+    ) in migration_sql
+
+
+def test_global_status_updated_at_index_is_added(migration_sql: str):
+    assert (
+        "CREATE INDEX ix_documents_status_updated_at "
+        "ON documents (status, updated_at)"
+    ) in migration_sql
+
+
+def test_downgrade_removes_the_phase4_schema(downgrade_sql: str):
+    assert "DROP INDEX ix_documents_status_updated_at" in downgrade_sql
+    assert "ALTER TABLE documents DROP COLUMN retryable" in downgrade_sql
+
+
+def test_orm_document_matches_the_phase4_migration():
+    column = Document.__table__.c.retryable
+    assert isinstance(column.type, Boolean)
+    assert column.nullable is False
+    assert column.server_default is not None
+    assert str(column.server_default.arg) == "false"
+
+    indexes = {index.name: index for index in Document.__table__.indexes}
+    index = indexes["ix_documents_status_updated_at"]
+    assert [indexed.name for indexed in index.columns] == [
+        "status",
+        "updated_at",
+    ]
 
 
 def test_foreign_key_delete_actions_are_preserved(migration_sql: str):
