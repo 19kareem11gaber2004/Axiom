@@ -23,6 +23,7 @@ must still pick up the same ``.env``.
 """
 
 from pathlib import Path
+from urllib.parse import urlsplit, urlunsplit
 
 from pydantic import field_validator, model_validator
 from pydantic_settings import BaseSettings
@@ -31,6 +32,75 @@ from pydantic_settings import BaseSettings
 # without any setup, and it is rejected outside the "dev" environment
 # (see Settings._reject_default_secret_outside_dev).
 DEV_JWT_SECRET = "dev-only-insecure-jwt-secret-change-me"
+
+_REDIS_SCHEMES = frozenset({"redis", "rediss"})
+
+
+def require_redis_url(value: str, setting_name: str) -> str:
+    """Validate and normalise a Redis connection URL.
+
+    Celery accepts only the Redis transport here, and a typo in the
+    scheme must fail at startup rather than after the first publish. The
+    URL is returned with surrounding whitespace removed; credentials,
+    query parameters and fragments are preserved.
+
+    The optional path component is the Redis database number. It must be
+    empty, the root path, or a non-negative decimal integer. Database
+    numbers are not otherwise range-checked here: the configured Redis
+    server owns that limit.
+    """
+
+    candidate = value.strip()
+    if any(character.isspace() for character in candidate):
+        raise ValueError(f"{setting_name} must not contain whitespace.")
+
+    try:
+        parts = urlsplit(candidate)
+        hostname = parts.hostname
+        # Accessing .port forces urlsplit to validate the port syntax.
+        port = parts.port
+    except ValueError:
+        raise ValueError(
+            f"{setting_name} is not a valid Redis URL."
+        ) from None
+
+    if parts.scheme not in _REDIS_SCHEMES:
+        raise ValueError(
+            f"{setting_name} must use redis:// or rediss://, got "
+            f"{parts.scheme or '<empty>'!r}."
+        )
+    if not hostname:
+        raise ValueError(f"{setting_name} must include a host.")
+    if port is not None and not 1 <= port <= 65535:
+        raise ValueError(f"{setting_name} has an invalid port.")
+
+    database = parts.path[1:]
+    if parts.path not in ("", "/") and not (
+        database.isascii() and database.isdigit()
+    ):
+        raise ValueError(
+            f"{setting_name} has an invalid Redis database path."
+        )
+    return candidate
+
+
+def redis_url_with_database(
+    value: str, database: int, setting_name: str
+) -> str:
+    """Return a Redis URL pointed at a specific logical database.
+
+    The path component is replaced while the scheme, credentials, host,
+    port, query parameters and fragment are kept intact. This is used to
+    give the Celery broker and result backend separate databases without
+    requiring operators to duplicate the full Redis URL.
+    """
+
+    normalised = require_redis_url(value, setting_name)
+    parts = urlsplit(normalised)
+    return urlunsplit(
+        (parts.scheme, parts.netloc, f"/{database}", parts.query, parts.fragment)
+    )
+
 
 # The repository root is two levels above this file:
 #   backend/app/config.py -> backend/app -> backend -> <repo root>
@@ -53,6 +123,34 @@ class Settings(BaseSettings):
     database_url: str = "postgresql+psycopg://axiom:axiom@127.0.0.1:5432/axiom"
     redis_url: str = "redis://127.0.0.1:6379/0"
     env: str = "dev"
+
+    # --- Background processing (Phase 4) ---
+    # A document is claimed at most this many times. Manual retries do not
+    # consume the budget; the next claim does.
+    max_processing_attempts: int = 5
+    # Exponential backoff before publishing a fresh attempt after a
+    # transient failure: min(base * 2^(attempt-1) + jitter, maximum).
+    processing_retry_base_seconds: int = 30
+    processing_retry_max_seconds: int = 900
+    processing_retry_jitter_seconds: int = 10
+
+    # How often Beat enqueues documents.sweep, and how old a row must be
+    # before each rule recovers it.
+    sweeper_interval_seconds: int = 60
+    sweeper_uploaded_stale_seconds: int = 300
+    sweeper_queued_stale_seconds: int = 600
+    sweeper_retrying_stale_seconds: int = 600
+    sweeper_processing_stale_seconds: int = 900
+    sweeper_batch_size: int = 100
+
+    # Celery transport. Empty values are derived from REDIS_URL: the
+    # broker uses database 1 and the result backend database 2, keeping
+    # both separate from the rate limiter's database 0.
+    celery_broker_url: str = ""
+    celery_result_backend: str = ""
+    celery_task_soft_time_limit_seconds: int = 480
+    celery_task_time_limit_seconds: int = 600
+    celery_visibility_timeout_seconds: int = 1800
 
     # --- Database connection limits ---
     # How long a single TCP connection attempt to PostgreSQL may take.
@@ -183,6 +281,109 @@ class Settings(BaseSettings):
         # Normalise the spelling so the rest of the code compares
         # against one value.
         object.__setattr__(self, "login_rate_limit_failure_mode", mode)
+        return self
+
+    @model_validator(mode="after")
+    def _resolve_celery_urls(self) -> "Settings":
+        """Derive the Celery endpoints when they are left unset.
+
+        The broker and result backend deliberately use separate Redis
+        databases. An explicit URL is honoured as-is, so a deployment
+        can point Celery at a different Redis instance without changing
+        REDIS_URL.
+        """
+
+        broker = self.celery_broker_url.strip()
+        if broker:
+            broker = require_redis_url(broker, "CELERY_BROKER_URL")
+        else:
+            broker = redis_url_with_database(self.redis_url, 1, "REDIS_URL")
+
+        backend = self.celery_result_backend.strip()
+        if backend:
+            backend = require_redis_url(backend, "CELERY_RESULT_BACKEND")
+        else:
+            backend = redis_url_with_database(
+                self.redis_url, 2, "REDIS_URL"
+            )
+
+        object.__setattr__(self, "celery_broker_url", broker)
+        object.__setattr__(self, "celery_result_backend", backend)
+        return self
+
+    @model_validator(mode="after")
+    def _validate_phase4_limits(self) -> "Settings":
+        """Reject configurations that make the worker unreliable.
+
+        These relationships are part of the job-reliability contract:
+        Celery must have time to deliver a soft timeout before the hard
+        kill, and the sweeper must not consider a live task stale.
+        """
+
+        if self.max_processing_attempts < 1:
+            raise ValueError("MAX_PROCESSING_ATTEMPTS must be at least 1.")
+        if self.processing_retry_base_seconds <= 0:
+            raise ValueError(
+                "PROCESSING_RETRY_BASE_SECONDS must be positive."
+            )
+        if self.processing_retry_jitter_seconds < 0:
+            raise ValueError(
+                "PROCESSING_RETRY_JITTER_SECONDS must not be negative."
+            )
+        if (
+            self.processing_retry_max_seconds
+            < self.processing_retry_base_seconds
+        ):
+            raise ValueError(
+                "PROCESSING_RETRY_MAX_SECONDS must be greater than or equal "
+                "to PROCESSING_RETRY_BASE_SECONDS."
+            )
+
+        if self.celery_task_soft_time_limit_seconds <= 0:
+            raise ValueError(
+                "CELERY_TASK_SOFT_TIME_LIMIT_SECONDS must be positive."
+            )
+        if not (
+            self.celery_task_soft_time_limit_seconds
+            < self.celery_task_time_limit_seconds
+            < self.celery_visibility_timeout_seconds
+        ):
+            raise ValueError(
+                "CELERY_TASK_SOFT_TIME_LIMIT_SECONDS must be less than "
+                "CELERY_TASK_TIME_LIMIT_SECONDS, which must be less than "
+                "CELERY_VISIBILITY_TIMEOUT_SECONDS."
+            )
+        if (
+            self.sweeper_processing_stale_seconds
+            <= self.celery_task_time_limit_seconds
+        ):
+            raise ValueError(
+                "SWEEPER_PROCESSING_STALE_SECONDS must be greater than "
+                "CELERY_TASK_TIME_LIMIT_SECONDS."
+            )
+
+        for name, value in (
+            ("SWEEPER_INTERVAL_SECONDS", self.sweeper_interval_seconds),
+            (
+                "SWEEPER_UPLOADED_STALE_SECONDS",
+                self.sweeper_uploaded_stale_seconds,
+            ),
+            (
+                "SWEEPER_QUEUED_STALE_SECONDS",
+                self.sweeper_queued_stale_seconds,
+            ),
+            (
+                "SWEEPER_RETRYING_STALE_SECONDS",
+                self.sweeper_retrying_stale_seconds,
+            ),
+            (
+                "SWEEPER_PROCESSING_STALE_SECONDS",
+                self.sweeper_processing_stale_seconds,
+            ),
+            ("SWEEPER_BATCH_SIZE", self.sweeper_batch_size),
+        ):
+            if value <= 0:
+                raise ValueError(f"{name} must be positive.")
         return self
 
     @property
