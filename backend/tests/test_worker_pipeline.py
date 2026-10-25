@@ -19,12 +19,25 @@ import logging
 import uuid
 
 import pytest
-from sqlalchemy import select
+from sqlalchemy import event, func, select, update
 from sqlalchemy.exc import IntegrityError
 
-from app.db.models import Document, ProcessingRun, User, Workspace
+from app.db.models import (
+    Chunk,
+    Document,
+    EMBEDDING_DIM,
+    ProcessingRun,
+    User,
+    Workspace,
+)
+from app.processing import (
+    ChunkConflict,
+    NewChunk,
+    PermanentFinalError,
+    ProcessResult,
+)
 from app.storage.keys import storage_key_for
-from app.worker.pipeline import ClaimedDocument, claim_document
+from app.worker.pipeline import ClaimedDocument, claim_document, commit_success
 
 PDF_BYTES = b"%PDF-1.7\n1 0 obj\n<< /Type /Catalog >>\nendobj\n%%EOF\n"
 
@@ -36,6 +49,44 @@ def _runs(session, document_id: uuid.UUID) -> list[ProcessingRun]:
             .where(ProcessingRun.document_id == document_id)
             .order_by(ProcessingRun.attempt_no)
         ).scalars()
+    )
+
+
+def _chunks(session, document_id: uuid.UUID) -> list[Chunk]:
+    return list(
+        session.execute(
+            select(Chunk)
+            .where(Chunk.document_id == document_id)
+            .order_by(Chunk.chunk_index)
+        ).scalars()
+    )
+
+
+def _new_chunk(content: str, *, page_number: int | None = None) -> NewChunk:
+    """A processor result chunk with a real 768-dimension zero vector."""
+    return NewChunk(
+        content=content,
+        page_number=page_number,
+        source_type="text",
+        chunk_version="v1",
+        embedding_model="test-768",
+        embedding_dim=EMBEDDING_DIM,
+        embedding=tuple(0.0 for _ in range(EMBEDDING_DIM)),
+    )
+
+
+def _stored_chunk(document: Document, chunk_index: int, content: str) -> Chunk:
+    return Chunk(
+        document_id=document.id,
+        workspace_id=document.workspace_id,
+        chunk_index=chunk_index,
+        content=content,
+        page_number=None,
+        source_type="text",
+        chunk_version="v1",
+        embedding_model="test-768",
+        embedding_dim=EMBEDDING_DIM,
+        embedding=[0.0] * EMBEDDING_DIM,
     )
 
 
@@ -272,3 +323,269 @@ def test_a_failed_run_insert_rolls_the_claim_back(db_session):
     runs = _runs(db_session, document.id)
     assert len(runs) == 1
     assert runs[0].stage == "indexed"
+
+
+# ---------------------------------------------------------------------------
+# The guarded commit
+# ---------------------------------------------------------------------------
+
+def test_commit_success_indexes_a_document_with_zero_chunks(db_session):
+    document = _make_document(db_session)
+    claim = claim_document(db_session, document.id, max_attempts=5)
+    assert claim is not None
+
+    # Simulate a transient failure flag set after the claim; the guarded
+    # commit must clear it when it wins.
+    db_session.execute(
+        update(Document)
+        .where(Document.id == document.id)
+        .values(
+            error_code="STORAGE_UNAVAILABLE",
+            error_message="temporary read failure",
+            retryable=True,
+        )
+    )
+    db_session.commit()
+
+    assert commit_success(db_session, claim, ProcessResult(chunks=())) is True
+
+    db_session.refresh(document)
+    assert document.status == "indexed"
+    assert document.indexed_at is not None
+    assert document.error_code is None
+    assert document.error_message is None
+    assert document.retryable is False
+    assert _chunks(db_session, document.id) == []
+
+    runs = _runs(db_session, document.id)
+    assert len(runs) == 1
+    assert runs[0].stage == "indexed"
+    assert runs[0].finished_at is not None
+
+
+def test_commit_success_persists_chunks_in_sequential_order(db_session):
+    document = _make_document(db_session)
+    claim = claim_document(db_session, document.id, max_attempts=5)
+    assert claim is not None
+
+    result = ProcessResult(
+        chunks=(
+            _new_chunk("first passage", page_number=2),
+            _new_chunk("second passage", page_number=3),
+        )
+    )
+
+    assert commit_success(db_session, claim, result) is True
+
+    chunks = _chunks(db_session, document.id)
+    assert [chunk.chunk_index for chunk in chunks] == [0, 1]
+    assert [chunk.content for chunk in chunks] == [
+        "first passage",
+        "second passage",
+    ]
+    assert [chunk.page_number for chunk in chunks] == [2, 3]
+    assert all(chunk.document_id == document.id for chunk in chunks)
+    assert all(chunk.workspace_id == document.workspace_id for chunk in chunks)
+    assert all(chunk.embedding_dim == EMBEDDING_DIM for chunk in chunks)
+    assert all(len(chunk.embedding) == EMBEDDING_DIM for chunk in chunks)
+
+    db_session.refresh(document)
+    assert document.status == "indexed"
+
+
+def test_commit_success_replaces_existing_chunks(db_session):
+    document = _make_document(db_session)
+    old_chunks = [
+        _stored_chunk(document, 0, "old first"),
+        _stored_chunk(document, 1, "old second"),
+    ]
+    db_session.add_all(old_chunks)
+    db_session.commit()
+    old_ids = {chunk.id for chunk in old_chunks}
+    assert len(old_ids) == 2
+
+    claim = claim_document(db_session, document.id, max_attempts=5)
+    assert claim is not None
+    assert commit_success(
+        db_session,
+        claim,
+        ProcessResult(chunks=(_new_chunk("replacement"),)),
+    ) is True
+
+    chunks = _chunks(db_session, document.id)
+    assert [chunk.chunk_index for chunk in chunks] == [0]
+    assert [chunk.content for chunk in chunks] == ["replacement"]
+    assert {chunk.id for chunk in chunks}.isdisjoint(old_ids)
+
+
+def test_duplicate_chunk_indexes_raise_chunk_conflict_and_keep_old_chunks(
+    db_session,
+):
+    """A duplicate index can only come from another writer.
+
+    ``commit_success`` assigns indexes sequentially, so this test injects
+    the second insert that a concurrent writer would produce and lets the
+    real unique constraint raise ``IntegrityError``.
+    """
+    document = _make_document(db_session)
+    db_session.add(_stored_chunk(document, 0, "old chunk"))
+    db_session.commit()
+
+    claim = claim_document(db_session, document.id, max_attempts=5)
+    assert claim is not None
+
+    injected = {"added": False}
+
+    def add_conflicting_chunk(session, flush_context, instances):
+        if injected["added"]:
+            return
+        injected["added"] = True
+        session.add(_stored_chunk(document, 0, "concurrent writer"))
+
+    event.listen(db_session, "before_flush", add_conflicting_chunk)
+    try:
+        with pytest.raises(ChunkConflict) as caught:
+            commit_success(
+                db_session,
+                claim,
+                ProcessResult(chunks=(_new_chunk("new chunk"),)),
+            )
+    finally:
+        event.remove(db_session, "before_flush", add_conflicting_chunk)
+
+    assert isinstance(caught.value, PermanentFinalError)
+    assert caught.value.retryable is False
+
+    db_session.refresh(document)
+    assert document.status == "processing"
+    assert document.processing_attempts == 1
+
+    chunks = _chunks(db_session, document.id)
+    assert [chunk.content for chunk in chunks] == ["old chunk"]
+
+    runs = _runs(db_session, document.id)
+    assert len(runs) == 1
+    assert runs[0].stage == "claimed"
+    assert runs[0].finished_at is None
+
+
+def test_a_stale_commit_returns_false_without_changing_anything(
+    db_session, caplog
+):
+    document = _make_document(db_session)
+    db_session.add(_stored_chunk(document, 0, "old chunk"))
+    db_session.commit()
+
+    first_claim = claim_document(db_session, document.id, max_attempts=5)
+    assert first_claim is not None
+
+    # Simulate the sweeper recovering a dead worker: processing -> retrying,
+    # and close the first run row.
+    db_session.execute(
+        update(Document)
+        .where(Document.id == document.id)
+        .values(status="retrying", retryable=True, updated_at=func.now())
+    )
+    db_session.execute(
+        update(ProcessingRun)
+        .where(
+            ProcessingRun.document_id == document.id,
+            ProcessingRun.attempt_no == first_claim.attempt_no,
+        )
+        .values(
+            stage="timeout",
+            finished_at=func.now(),
+            error_code="PROCESSING_TIMEOUT",
+        )
+    )
+    db_session.commit()
+
+    second_claim = claim_document(db_session, document.id, max_attempts=5)
+    assert second_claim is not None
+    assert second_claim.attempt_no == 2
+
+    with caplog.at_level(logging.WARNING, logger="axiom.worker.pipeline"):
+        committed = commit_success(
+            db_session,
+            first_claim,
+            ProcessResult(chunks=(_new_chunk("stale chunk"),)),
+        )
+
+    assert committed is False
+
+    db_session.refresh(document)
+    assert document.status == "processing"
+    assert document.processing_attempts == 2
+
+    chunks = _chunks(db_session, document.id)
+    assert [chunk.content for chunk in chunks] == ["old chunk"]
+
+    runs = _runs(db_session, document.id)
+    assert len(runs) == 2
+    first_run = next(run for run in runs if run.attempt_no == 1)
+    second_run = next(run for run in runs if run.attempt_no == 2)
+    assert first_run.stage == "timeout"
+    assert first_run.finished_at is not None
+    assert second_run.stage == "claimed"
+    assert second_run.finished_at is None
+
+    assert any(
+        "document.stale_commit" in record.getMessage()
+        for record in caplog.records
+    )
+
+
+def test_a_deleted_document_is_not_resurrected(db_session):
+    document = _make_document(db_session)
+    claim = claim_document(db_session, document.id, max_attempts=5)
+    assert claim is not None
+    document_id = document.id
+
+    db_session.delete(document)
+    db_session.commit()
+
+    assert commit_success(db_session, claim, ProcessResult(chunks=())) is False
+
+    assert (
+        db_session.execute(
+            select(Document).where(Document.id == document_id)
+        ).scalar_one_or_none()
+        is None
+    )
+    assert _chunks(db_session, document_id) == []
+    assert _runs(db_session, document_id) == []
+
+
+def test_the_run_row_is_closed_exactly_once(db_session):
+    document = _make_document(db_session)
+    claim = claim_document(db_session, document.id, max_attempts=5)
+    assert claim is not None
+
+    assert commit_success(
+        db_session,
+        claim,
+        ProcessResult(chunks=(_new_chunk("kept chunk"),)),
+    ) is True
+
+    runs = _runs(db_session, document.id)
+    assert len(runs) == 1
+    closed_at = runs[0].finished_at
+    assert closed_at is not None
+    assert runs[0].stage == "indexed"
+
+    # A duplicate success delivery is stale: the document is already
+    # indexed, so the guarded UPDATE rejects it and its chunk replacement
+    # must not become visible.
+    assert commit_success(
+        db_session,
+        claim,
+        ProcessResult(chunks=(_new_chunk("ignored chunk"),)),
+    ) is False
+
+    runs = _runs(db_session, document.id)
+    assert len(runs) == 1
+    assert runs[0].stage == "indexed"
+    assert runs[0].finished_at == closed_at
+    assert [chunk.content for chunk in _chunks(db_session, document.id)] == [
+        "kept chunk"
+    ]

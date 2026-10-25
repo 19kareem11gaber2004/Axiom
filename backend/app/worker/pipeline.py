@@ -26,14 +26,17 @@ import logging
 import uuid
 from dataclasses import dataclass
 
-from sqlalchemy import func, select, update
+from sqlalchemy import delete, func, select, update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from app.db.models import Document, ProcessingRun
+from app.db.models import Chunk, Document, ProcessingRun
+from app.processing.base import ProcessResult
+from app.processing.errors import ChunkConflict
 
 logger = logging.getLogger("axiom.worker.pipeline")
 
-__all__ = ["ClaimedDocument", "claim_document"]
+__all__ = ["ClaimedDocument", "claim_document", "commit_success"]
 
 
 @dataclass(frozen=True)
@@ -158,3 +161,125 @@ def claim_document(
         max_attempts,
     )
     return claimed
+
+
+def commit_success(
+    session: Session,
+    claim: ClaimedDocument,
+    result: ProcessResult,
+) -> bool:
+    """Atomically replace the chunk set and mark the document indexed.
+
+    The guarded UPDATE is the stale-worker barrier. It matches only while
+    the document is still in a worker-owned state and
+    ``processing_attempts`` still equals the attempt this worker claimed.
+    A sweeper timeout followed by a new claim increments that counter, so
+    the old worker's commit matches zero rows, rolls back its chunk
+    replacement, and returns ``False``.
+
+    The chunk INSERT is flushed inside the same transaction as the
+    DELETE, the document UPDATE, and the run-row close. A duplicate
+    ``(document_id, chunk_index)`` raises ``ChunkConflict`` and rolls all
+    of it back, so the previous chunk set remains visible and no partial
+    new set is ever committed.
+
+    Returns ``True`` only when the document UPDATE matched and the
+    transaction committed.
+    """
+    chunk_rows = [
+        Chunk(
+            document_id=claim.id,
+            workspace_id=claim.workspace_id,
+            chunk_index=index,
+            content=chunk.content,
+            page_number=chunk.page_number,
+            source_type=chunk.source_type,
+            chunk_version=chunk.chunk_version,
+            embedding_model=chunk.embedding_model,
+            embedding_dim=chunk.embedding_dim,
+            embedding=list(chunk.embedding),
+        )
+        for index, chunk in enumerate(result.chunks)
+    ]
+
+    try:
+        session.execute(
+            delete(Chunk)
+            .where(
+                Chunk.document_id == claim.id,
+                Chunk.workspace_id == claim.workspace_id,
+            )
+            .execution_options(synchronize_session=False)
+        )
+    except Exception:
+        session.rollback()
+        raise
+
+    try:
+        session.add_all(chunk_rows)
+        # Flush now so a unique/FK/vector failure surfaces here, while the
+        # transaction can still be rolled back as a chunk conflict. A
+        # deferred failure at commit() would be indistinguishable from a
+        # transaction-level error.
+        session.flush()
+    except IntegrityError as exc:
+        session.rollback()
+        raise ChunkConflict() from exc
+
+    try:
+        indexed = session.execute(
+            update(Document)
+            .where(
+                Document.id == claim.id,
+                Document.workspace_id == claim.workspace_id,
+                Document.status.in_(("processing", "retrying")),
+                Document.processing_attempts == claim.attempt_no,
+            )
+            .values(
+                status="indexed",
+                indexed_at=func.now(),
+                updated_at=func.now(),
+                error_code=None,
+                error_message=None,
+                retryable=False,
+            )
+            .returning(Document.id)
+            .execution_options(synchronize_session=False)
+        ).one_or_none()
+
+        if indexed is None:
+            # A sweeper or a newer claim won. The DELETE and INSERT above
+            # are part of this transaction and disappear with the rollback.
+            session.rollback()
+            logger.warning(
+                "document.stale_commit document_id=%s workspace_id=%s "
+                "attempt=%d",
+                claim.id,
+                claim.workspace_id,
+                claim.attempt_no,
+            )
+            return False
+
+        session.execute(
+            update(ProcessingRun)
+            .where(
+                ProcessingRun.document_id == claim.id,
+                ProcessingRun.workspace_id == claim.workspace_id,
+                ProcessingRun.attempt_no == claim.attempt_no,
+                ProcessingRun.finished_at.is_(None),
+            )
+            .values(stage="indexed", finished_at=func.now())
+            .execution_options(synchronize_session=False)
+        )
+        session.commit()
+    except Exception:
+        session.rollback()
+        raise
+
+    logger.info(
+        "Document %s committed as indexed (attempt %d, %d chunk(s)).",
+        claim.id,
+        claim.attempt_no,
+        len(chunk_rows),
+    )
+    return True

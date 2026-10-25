@@ -275,7 +275,7 @@ def test_a_leaked_os_error_maps_to_transient_storage_io_error():
             False,
             True,
         ),
-        (ChunkConflict, PermanentFixableError, "CHUNK_CONFLICT", False, True),
+        (ChunkConflict, PermanentFinalError, "CHUNK_CONFLICT", False, False),
         (StoragePathInvalid, PermanentFinalError, "STORAGE_PATH_INVALID", False, False),
         (ChecksumMismatch, PermanentFinalError, "CHECKSUM_MISMATCH", False, False),
         (InvalidPdf, PermanentFinalError, "INVALID_PDF", False, False),

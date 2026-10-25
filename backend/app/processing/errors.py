@@ -136,12 +136,13 @@ class StoragePermissionDenied(PermanentFixableError):
     safe_message = "The storage backend denied access to the document."
 
 
-class ChunkConflict(PermanentFixableError):
+class ChunkConflict(PermanentFinalError):
     """The chunk set could not be committed because of a conflict.
 
-    A manual retry re-runs the guarded commit and normally succeeds; the
-    worker does not retry automatically because a persistent conflict
-    would otherwise consume every attempt.
+    Duplicate ``(document_id, chunk_index)`` values are a deterministic
+    conflict: retrying the same commit would produce it again. The guarded
+    commit rolls the whole transaction back, so the previous chunk set is
+    left intact and no partial new set is visible.
     """
 
     code = "CHUNK_CONFLICT"
