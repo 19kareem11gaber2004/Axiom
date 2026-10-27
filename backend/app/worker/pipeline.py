@@ -226,7 +226,8 @@ def claim_document(
         raise
 
     logger.info(
-        "Document %s claimed for workspace %s (attempt %d/%d).",
+        "document.claim document_id=%s workspace_id=%s attempt=%d "
+        "max_attempts=%d",
         claimed.id,
         claimed.workspace_id,
         claimed.attempt_no,

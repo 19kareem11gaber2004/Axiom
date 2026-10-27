@@ -177,7 +177,7 @@ def _make_document(
 # The winning claim
 # ---------------------------------------------------------------------------
 
-def test_claim_moves_a_queued_document_to_processing(db_session):
+def test_claim_moves_a_queued_document_to_processing(db_session, caplog):
     document = _make_document(
         db_session,
         retryable=True,
@@ -185,7 +185,13 @@ def test_claim_moves_a_queued_document_to_processing(db_session):
         error_message="a previous failure",
     )
 
-    claimed = claim_document(db_session, document.id, max_attempts=5)
+    with caplog.at_level(logging.INFO, logger="axiom.worker.pipeline"):
+        claimed = claim_document(db_session, document.id, max_attempts=5)
+
+    assert any(
+        "document.claim" in record.getMessage()
+        for record in caplog.records
+    )
 
     assert isinstance(claimed, ClaimedDocument)
     assert claimed.id == document.id

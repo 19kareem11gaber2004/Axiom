@@ -1003,6 +1003,7 @@ Every document indexed by Phase 4 is in this set. Explain why this is expected a
 
 | Event | Meaning |
 |---|---|
+| `document.claim` | a worker won the claim and opened a processing run |
 | `document.indexed` | guarded commit won; chunks replaced; run closed |
 | `document.stale` | a late commit/failure found a newer owner; no write |
 | `document.stale_commit` | a worker tried to commit after losing its claim |
