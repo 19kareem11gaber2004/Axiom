@@ -58,6 +58,15 @@ jobs:
       - name: Build Docker image
         run: docker compose build
 
+      - name: Prepare the Compose database
+        # The Compose stack owns a PostgreSQL volume separate from the
+        # job service above. Migrate that database too; otherwise the API
+        # is "ready" (SELECT 1 succeeds) but has no application tables.
+        run: |
+          mkdir -p backend/storage
+          docker compose up -d --wait --wait-timeout 180 postgres redis
+          docker compose run --rm --no-deps api alembic upgrade head
+
       - name: Smoke-test the API, worker, and Beat containers
         # The worker used to exit with code 1 (a missing task module) and
         # nothing reported it: the API does not depend on the worker, and
@@ -68,9 +77,6 @@ jobs:
         # configuration the Compose file gives it, and that it reaches
         # PostgreSQL and Redis over the Compose network.
         run: |
-          # Create the bind-mount source as the runner user. If Compose
-          # creates it instead, Docker owns the host directory as root.
-          mkdir -p backend/storage
           docker compose up -d --wait --wait-timeout 180 api worker beat
 
           # --wait only proves the containers are running. Celery and Beat
@@ -122,5 +128,12 @@ jobs:
           docker compose exec -T api sh -c 'printf "shared-storage" > /srv/backend/storage/.compose-smoke'
           test "$(docker compose exec -T worker cat /srv/backend/storage/.compose-smoke)" = "shared-storage"
 
+      - name: Collect container diagnostics on failure
+        if: failure()
+        run: |
+          docker compose ps
+          docker compose logs --no-color --tail=300
+
       - name: Stop the containers
-        run: docker compose down
+        if: always()
+        run: docker compose down -v
