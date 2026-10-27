@@ -32,6 +32,8 @@
 x-app-environment: &app-environment
   DATABASE_URL: ${AXIOM_DATABASE_URL:-postgresql+psycopg://axiom:axiom@postgres:5432/axiom}
   REDIS_URL: ${AXIOM_REDIS_URL:-redis://redis:6379/0}
+  CELERY_BROKER_URL: ${AXIOM_CELERY_BROKER_URL:-redis://redis:6379/1}
+  CELERY_RESULT_BACKEND: ${AXIOM_CELERY_RESULT_BACKEND:-redis://redis:6379/2}
   ENV: ${AXIOM_ENV:-dev}
   JWT_SECRET_KEY: ${AXIOM_JWT_SECRET_KEY:-dev-only-insecure-jwt-secret-change-me}
   LOGIN_RATE_LIMIT_FAILURE_MODE: ${AXIOM_LOGIN_RATE_LIMIT_FAILURE_MODE:-open}
@@ -101,14 +103,29 @@ services:
       # The same host directory as the api service: the worker can read
       # the object the API stored for a queued document.
       - ./backend/storage:/srv/backend/storage
-    command: ["celery", "-A", "app.worker.celery_app", "worker", "--loglevel=info"]
+    command: ["celery", "-A", "app.worker.celery_app", "worker", "--loglevel=info", "--concurrency=2"]
     depends_on:
       postgres:
         condition: service_healthy
       redis:
         condition: service_healthy
-    # Give a running task time to finish before the container is killed.
+    # Give a running task time to finish before the container is killed. A
+    # hard kill after this grace period is recovered by the sweeper, which
+    # re-queues documents left in processing or retrying past the stale
+    # threshold.
     stop_grace_period: 30s
+    user: "65532:65532"
+    restart: unless-stopped
+
+  beat:
+    build: ./backend
+    environment: *app-environment
+    command: ["celery", "-A", "app.worker.celery_app", "beat", "--loglevel=info", "--schedule=/tmp/celerybeat-schedule"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
     user: "65532:65532"
     restart: unless-stopped
 
