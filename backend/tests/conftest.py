@@ -63,6 +63,48 @@ def db_session():
         connection.close()
 
 
+@pytest.fixture
+def independent_db():
+    """Override ``get_db`` with a fresh session for each request.
+
+    The savepoint-backed ``db_session`` fixture cannot exercise two
+    simultaneous transactions or expose committed rows to a worker thread.
+    Tests that need real concurrency use this fixture instead, usually
+    together with rows created and committed through ``SessionLocal``.
+    Do not request both ``db_session`` and ``independent_db`` in one test.
+    """
+    from app.db.session import SessionLocal, close_session, get_db
+    from app.main import app
+
+    def override_get_db():
+        db = SessionLocal()
+        try:
+            yield db
+        finally:
+            close_session(db)
+
+    app.dependency_overrides[get_db] = override_get_db
+    try:
+        yield
+    finally:
+        app.dependency_overrides.pop(get_db, None)
+
+
+@pytest.fixture
+def recording_publisher():
+    """Install a recording TaskPublisher in FastAPI's dependency map."""
+    from app.main import app
+    from app.worker.publisher import get_task_publisher
+    from tests.fakes.publisher import RecordingTaskPublisher
+
+    publisher = RecordingTaskPublisher()
+    app.dependency_overrides[get_task_publisher] = lambda: publisher
+    try:
+        yield publisher
+    finally:
+        app.dependency_overrides.pop(get_task_publisher, None)
+
+
 # ---------------------------------------------------------------------------
 # Storage adapters
 # ---------------------------------------------------------------------------

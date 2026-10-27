@@ -14,7 +14,7 @@ import uuid
 from typing import Optional
 
 from fastapi import APIRouter, Depends, File, Response, UploadFile, status
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
 from sqlalchemy.orm import Session
 
 from app.api.errors import (
@@ -45,6 +45,7 @@ from app.storage import (
     StorageUnavailableError,
     get_storage,
 )
+from app.worker.publisher import TaskPublisher, get_task_publisher
 
 logger = logging.getLogger("axiom.documents")
 
@@ -95,22 +96,50 @@ def _to_list_item(document: Document) -> DocumentListItem:
     )
 
 
+def _publish_document(
+    publisher: TaskPublisher,
+    document_id: uuid.UUID,
+    status: str,
+) -> None:
+    """Publish one task and keep a broker failure out of the response.
+
+    The database transition is already committed. A failed publish is
+    recoverable by the sweeper, so it must not turn a successful upload or
+    retry into an API error.
+    """
+    if publisher.enqueue_document(document_id, countdown=0):
+        return
+    logger.warning(
+        "document.enqueue document_id=%s status=%s published=false",
+        document_id,
+        status,
+    )
+
+
 def _load_document(
     db: Session,
     document_id: uuid.UUID,
     membership: CurrentMembership,
+    *,
+    for_update: bool = False,
 ) -> Document:
     """Load a document that belongs to the caller's workspace.
 
     Raises 404 when the document does not exist *or* belongs to another
     workspace - the caller cannot tell the difference.
+
+    ``for_update=True`` takes a row lock with the SELECT. The delete route
+    uses it so a concurrent worker claim must wait and then observe either
+    a deleted row or a committed status it must respect.
     """
-    document = db.execute(
-        select(Document).where(
-            Document.id == document_id,
-            Document.workspace_id == membership.workspace_id,
-        )
-    ).scalar_one_or_none()
+    statement = select(Document).where(
+        Document.id == document_id,
+        Document.workspace_id == membership.workspace_id,
+    )
+    if for_update:
+        statement = statement.with_for_update()
+
+    document = db.execute(statement).scalar_one_or_none()
 
     if document is None:
         raise NotFoundError("Document not found.")
@@ -143,16 +172,19 @@ def upload_document(
     membership: CurrentMembership = Depends(require_role(*UPLOAD_ROLE)),
     db: Session = Depends(get_db),
     storage: FileStorage = Depends(get_storage),
+    publisher: TaskPublisher = Depends(get_task_publisher),
 ):
     """Accept a PDF for background processing.
 
-    A new document is stored and committed as "queued", then answered with
-    202. If the workspace already contains the same checksum, the existing
-    document is returned with 200 and ``duplicate=true``. Passing
-    ``allow_duplicate=true`` creates a second document instead.
+    A new document is stored and committed as "queued", then published and
+    answered with 202. If the workspace already contains the same checksum,
+    the existing document is returned with 200 and ``duplicate=true`` and
+    no task is published. Passing ``allow_duplicate=true`` creates a second
+    document instead, which is published normally.
 
     The ingestion service owns validation, deduplication, storage and the
-    single commit. This route only maps its domain errors onto HTTP.
+    single commit. This route maps its domain errors onto HTTP and starts
+    background processing after that commit.
     """
     try:
         result = ingest_upload(
@@ -175,6 +207,9 @@ def upload_document(
         raise DependencyUnavailableError(
             "Storage is temporarily unavailable; the upload was not accepted."
         ) from exc
+
+    if not result.duplicate:
+        _publish_document(publisher, result.document.id, result.document.status)
 
     response.status_code = (
         status.HTTP_200_OK if result.duplicate else status.HTTP_202_ACCEPTED
@@ -287,32 +322,57 @@ def retry_document(
     document_id: uuid.UUID,
     membership: CurrentMembership = Depends(get_current_membership),
     db: Session = Depends(get_db),
+    publisher: TaskPublisher = Depends(get_task_publisher),
 ):
-    """Re-queue a failed document for processing.
+    """Re-queue a failed, retryable document for processing.
 
-    Only a failed document can be retried. The distinction between a
-    permanent and a transient failure arrives with the worker's error
-    taxonomy in Phase 4.
+    The state change is one conditional UPDATE, so two concurrent retries
+    cannot both succeed: PostgreSQL serializes them on the row and the
+    loser re-evaluates the predicate against the committed ``queued`` row.
     """
-    document = _load_document(db, document_id, membership)
+    _load_document(db, document_id, membership)
     ensure_role(membership, *UPLOAD_ROLE)
 
-    if document.status != "failed":
+    row = db.execute(
+        update(Document)
+        .where(
+            Document.id == document_id,
+            Document.workspace_id == membership.workspace_id,
+            Document.status == "failed",
+            Document.retryable.is_(True),
+        )
+        .values(
+            status="queued",
+            error_code=None,
+            error_message=None,
+            retryable=False,
+            updated_at=func.now(),
+        )
+        .returning(Document.id)
+        .execution_options(synchronize_session=False)
+    ).scalar_one_or_none()
+
+    if row is None:
+        db.rollback()
         raise ConflictError(
-            "Only a failed document can be retried (current status: %s)."
-            % document.status
+            "The document is not failed or is not retryable, so it cannot "
+            "be retried."
         )
 
-    document.status = "queued"
-    document.error_code = None
-    document.error_message = None
-    document.processing_attempts += 1
-    document.updated_at = func.now()
-    db.commit()
-    db.refresh(document)
+    try:
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
 
-    logger.info("Document %s re-queued for processing", document.id)
-    return DocumentUploadResponse(document_id=document.id, status=document.status)
+    _publish_document(publisher, row, "queued")
+
+    logger.info("Document %s re-queued for processing", row)
+    return DocumentUploadResponse(
+        document_id=row,
+        status="queued",
+        duplicate=False,
+    )
 
 
 @router.delete("/{document_id}", status_code=status.HTTP_204_NO_CONTENT)
@@ -328,16 +388,19 @@ def delete_document(
     snapshot of the passage text, so past answers stay readable.
 
     The storage object is removed inside the database transaction's
-    window: the row delete is flushed first, then the object is removed,
-    then the transaction commits. A storage outage rolls the row deletion
-    back. The two systems cannot be perfectly atomic, so if the file is
-    removed and the commit then fails, the row remains and a retry safely
-    completes the delete (a missing object is idempotent).
+    window: the row is locked, deleted, and flushed first, then the object
+    is removed, then the transaction commits. A concurrent worker claim
+    must wait on the row lock and then either finds no document or sees
+    the committed deletion. A storage outage rolls the row deletion back.
+    The two systems cannot be perfectly atomic, so if the file is removed
+    and the commit then fails, the row remains and a retry safely completes
+    the delete (a missing object is idempotent).
     """
-    document = _load_document(db, document_id, membership)
+    document = _load_document(db, document_id, membership, for_update=True)
     ensure_role(membership, *DELETE_ROLE)
 
     if document.status in UNDELETABLE_STATUSES:
+        db.rollback()
         raise ConflictError(
             "A document that is being processed cannot be deleted."
         )

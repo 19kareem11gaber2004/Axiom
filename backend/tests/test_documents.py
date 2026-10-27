@@ -6,20 +6,36 @@ a real PostgreSQL database and an isolated temporary LocalFileStorage
 adapter. No test writes to ``backend/storage``.
 """
 
+import hashlib
 import io
+import logging
+import threading
+import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 
+import psycopg
 import pytest
 from fastapi.testclient import TestClient
-from sqlalchemy import select
+from sqlalchemy import delete, select, text
 
+from app.api.routes import documents as document_routes
 from app.auth.service import create_access_token
-from app.db.models import Document, User, Workspace, WorkspaceMembership
+from app.config import settings
+from app.db.models import (
+    Document,
+    ProcessingRun,
+    User,
+    Workspace,
+    WorkspaceMembership,
+)
+from app.db.session import SessionLocal, engine, psycopg_dsn
 from app.main import app
 from app.storage import get_storage
 from app.storage.base import StoragePathError, StorageUnavailableError
 from app.storage.keys import storage_key_for
 from app.storage.local import LocalFileStorage
+from app.worker.pipeline import claim_document
 
 client = TestClient(app, raise_server_exceptions=False)
 
@@ -58,6 +74,12 @@ def route_storage(tmp_path):
         yield storage
     finally:
         app.dependency_overrides.pop(get_storage, None)
+
+
+@pytest.fixture(autouse=True)
+def route_publisher(recording_publisher):
+    """Keep route tests off the broker and expose publish calls."""
+    return recording_publisher
 
 
 def _pdf(content: bytes = PDF_BYTES) -> bytes:
@@ -179,13 +201,14 @@ def test_upload_by_a_viewer_is_forbidden(viewer):
     assert r.json()["error"]["code"] == "FORBIDDEN"
 
 
-def test_upload_returns_202_and_queues_the_document(member):
+def test_upload_returns_202_and_queues_the_document(member, route_publisher):
     r = _upload(member)
     assert r.status_code == 202
     body = r.json()
     assert body["status"] == "queued"
     assert body["document_id"]
     assert body["duplicate"] is False
+    assert route_publisher.calls == [(uuid.UUID(body["document_id"]), 0)]
 
 
 def test_upload_persists_the_document_record(member, db_session):
@@ -215,7 +238,7 @@ def test_upload_writes_the_file_to_the_agreed_layout(member, route_storage):
 
 
 def test_duplicate_upload_returns_200_without_writing_again(
-    member, db_session, route_storage
+    member, db_session, route_storage, route_publisher
 ):
     first = _upload(member)
     second = _upload(member, filename="copy.pdf")
@@ -227,10 +250,13 @@ def test_duplicate_upload_returns_200_without_writing_again(
     assert second.json()["duplicate"] is True
     assert len(route_storage.saved) == 1
     assert len(_documents(db_session, member["workspace_id"])) == 1
+    assert route_publisher.calls == [
+        (uuid.UUID(first.json()["document_id"]), 0)
+    ]
 
 
 def test_allow_duplicate_creates_a_second_document(
-    member, db_session, route_storage
+    member, db_session, route_storage, route_publisher
 ):
     first = _upload(member)
     second = _upload(member, filename="copy.pdf", allow_duplicate=True)
@@ -241,6 +267,10 @@ def test_allow_duplicate_creates_a_second_document(
     assert second.json()["document_id"] != first.json()["document_id"]
     assert len(route_storage.saved) == 2
     assert len(_documents(db_session, member["workspace_id"])) == 2
+    assert route_publisher.calls == [
+        (uuid.UUID(first.json()["document_id"]), 0),
+        (uuid.UUID(second.json()["document_id"]), 0),
+    ]
 
 
 def test_same_checksum_in_another_workspace_is_a_new_document(
@@ -444,6 +474,33 @@ def test_upload_path_error_returns_500(
     assert len(_documents(db_session, member["workspace_id"])) == 0
 
 
+def test_upload_publish_failure_keeps_202_and_queued_state(
+    member, db_session, route_publisher, caplog
+):
+    route_publisher.result = False
+
+    with caplog.at_level(logging.WARNING, logger="axiom.documents"):
+        r = _upload(member)
+
+    assert r.status_code == 202, r.json()
+    body = r.json()
+    document_id = uuid.UUID(body["document_id"])
+    assert body["status"] == "queued"
+    assert body["duplicate"] is False
+
+    document = db_session.get(Document, document_id)
+    assert document is not None
+    assert document.status == "queued"
+    assert route_publisher.calls == [(document_id, 0)]
+    assert any(
+        record.name == "axiom.documents"
+        and "document.enqueue" in record.getMessage()
+        and str(document_id) in record.getMessage()
+        and "published=false" in record.getMessage()
+        for record in caplog.records
+    )
+
+
 # ---------------------------------------------------------------------------
 # Listing
 # ---------------------------------------------------------------------------
@@ -628,41 +685,80 @@ def test_download_path_error_is_500(member, route_storage, monkeypatch):
 # Retry
 # ---------------------------------------------------------------------------
 
-def test_retry_requires_a_failed_document(member, db_session):
+@pytest.mark.parametrize(
+    ("status", "retryable"),
+    [
+        ("failed", False),
+        ("queued", False),
+        ("indexed", False),
+    ],
+)
+def test_retry_rejects_non_retryable_or_non_failed_documents(
+    member,
+    db_session,
+    route_publisher,
+    status,
+    retryable,
+):
     r = _upload(member)
     document_id = uuid.UUID(r.json()["document_id"])
+    route_publisher.calls.clear()
+
+    document = db_session.execute(
+        select(Document).where(Document.id == document_id)
+    ).scalar_one()
+    document.status = status
+    document.retryable = retryable
+    db_session.commit()
 
     r2 = client.post(
         "/api/v1/documents/%s/retry" % document_id, headers=_auth(member)
     )
     assert r2.status_code == 409
     assert r2.json()["error"]["code"] == "INVALID_STATE"
+    assert "not failed" in r2.json()["error"]["message"]
+    assert "not retryable" in r2.json()["error"]["message"]
+    assert route_publisher.calls == []
+
+    db_session.expire(document)
+    assert document.status == status
+    assert document.retryable is retryable
 
 
-def test_retry_works_on_a_failed_document(member, db_session):
+def test_retry_requeues_a_failed_retryable_document(
+    member, db_session, route_publisher
+):
     r = _upload(member)
     document_id = uuid.UUID(r.json()["document_id"])
+    route_publisher.calls.clear()
 
     document = db_session.execute(
         select(Document).where(Document.id == document_id)
     ).scalar_one()
     document.status = "failed"
+    document.retryable = True
+    document.processing_attempts = 2
     document.error_code = "CORRUPT_PDF"
     document.error_message = "The PDF did not contain readable text."
-    db_session.flush()
+    db_session.commit()
 
     r2 = client.post(
         "/api/v1/documents/%s/retry" % document_id, headers=_auth(member)
     )
     assert r2.status_code == 200
-    assert r2.json()["status"] == "queued"
-    assert r2.json()["duplicate"] is False
+    assert r2.json() == {
+        "document_id": str(document_id),
+        "status": "queued",
+        "duplicate": False,
+    }
+    assert route_publisher.calls == [(document_id, 0)]
 
     db_session.expire(document)
     assert document.status == "queued"
     assert document.error_code is None
     assert document.error_message is None
-    assert document.processing_attempts == 1
+    assert document.retryable is False
+    assert document.processing_attempts == 2
 
 
 def test_retry_in_another_workspace_is_404(member, admin):
@@ -785,19 +881,23 @@ def test_delete_missing_object_still_removes_the_row(
     assert db_session.get(Document, document_id) is None
 
 
-def test_delete_is_blocked_while_processing(admin, db_session):
+@pytest.mark.parametrize("status", ["processing", "retrying"])
+def test_delete_is_blocked_while_processing(admin, db_session, status):
     r = _upload(admin)
     document_id = uuid.UUID(r.json()["document_id"])
 
     document = db_session.execute(
         select(Document).where(Document.id == document_id)
     ).scalar_one()
-    document.status = "processing"
-    db_session.flush()
+    document.status = status
+    db_session.commit()
 
     r2 = client.delete("/api/v1/documents/%s" % document_id, headers=_auth(admin))
     assert r2.status_code == 409
     assert r2.json()["error"]["code"] == "INVALID_STATE"
+
+    db_session.expire(document)
+    assert document.status == status
 
 
 def test_delete_in_another_workspace_is_404(member, admin):
@@ -810,3 +910,348 @@ def test_delete_in_another_workspace_is_404(member, admin):
 def test_delete_unknown_document_is_404(admin):
     r = client.delete("/api/v1/documents/%s" % uuid.uuid4(), headers=_auth(admin))
     assert r.status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# Committed-row concurrency tests
+#
+# The savepoint-backed db_session fixture keeps every row invisible to a
+# second connection, so it cannot prove what two simultaneous requests do.
+# These tests create real committed rows and install independent request
+# sessions through the ``independent_db`` fixture.
+# ---------------------------------------------------------------------------
+
+def _require_database() -> None:
+    try:
+        probe = psycopg.connect(psycopg_dsn(), connect_timeout=3)
+        probe.close()
+    except Exception as exc:
+        pytest.skip("PostgreSQL not available: %s" % exc)
+
+
+@pytest.fixture
+def committed_api_account():
+    """Create a real committed user/workspace/admin membership."""
+    _require_database()
+
+    user_id = uuid.uuid4()
+    workspace_id = uuid.uuid4()
+
+    setup = SessionLocal()
+    try:
+        setup.add_all(
+            [
+                User(
+                    id=user_id,
+                    email="api-race-%s@example.com" % uuid.uuid4().hex,
+                    password_hash="not-used-by-the-api",
+                ),
+                Workspace(
+                    id=workspace_id,
+                    name="api-race-%s" % uuid.uuid4().hex,
+                ),
+            ]
+        )
+        setup.flush()
+        setup.add(
+            WorkspaceMembership(
+                user_id=user_id,
+                workspace_id=workspace_id,
+                role="admin",
+            )
+        )
+        setup.commit()
+    finally:
+        setup.close()
+
+    try:
+        yield {
+            "user_id": user_id,
+            "workspace_id": workspace_id,
+            "role": "admin",
+        }
+    finally:
+        cleanup = SessionLocal()
+        try:
+            cleanup.execute(
+                delete(Document).where(Document.workspace_id == workspace_id)
+            )
+            cleanup.execute(
+                delete(WorkspaceMembership).where(
+                    WorkspaceMembership.workspace_id == workspace_id
+                )
+            )
+            cleanup.execute(
+                delete(Workspace).where(Workspace.id == workspace_id)
+            )
+            cleanup.execute(delete(User).where(User.id == user_id))
+            cleanup.commit()
+        finally:
+            cleanup.close()
+
+
+def _create_committed_document(
+    account,
+    *,
+    status: str,
+    retryable: bool = False,
+    processing_attempts: int = 0,
+) -> tuple[uuid.UUID, str]:
+    """Insert one document that other connections can see immediately."""
+    document_id = uuid.uuid4()
+    storage_key = storage_key_for(document_id)
+
+    setup = SessionLocal()
+    try:
+        setup.add(
+            Document(
+                id=document_id,
+                workspace_id=account["workspace_id"],
+                uploaded_by=account["user_id"],
+                original_filename="race.pdf",
+                storage_key=storage_key,
+                mime_type="application/pdf",
+                size_bytes=len(PDF_BYTES),
+                checksum=hashlib.sha256(
+                    PDF_BYTES + document_id.bytes
+                ).hexdigest(),
+                status=status,
+                retryable=retryable,
+                processing_attempts=processing_attempts,
+            )
+        )
+        setup.commit()
+    finally:
+        setup.close()
+
+    return document_id, storage_key
+
+
+def _post_retry_in_thread(
+    url: str,
+    headers: dict,
+    barrier: threading.Barrier,
+):
+    """Use a client per thread so TestClient portals never collide."""
+    request_client = TestClient(app, raise_server_exceptions=False)
+    try:
+        barrier.wait(timeout=10)
+        return request_client.post(url, headers=headers)
+    finally:
+        request_client.close()
+
+
+def test_two_concurrent_retries_have_exactly_one_winner(
+    committed_api_account,
+    independent_db,
+    route_publisher,
+):
+    document_id, _ = _create_committed_document(
+        committed_api_account,
+        status="failed",
+        retryable=True,
+    )
+    url = "/api/v1/documents/%s/retry" % document_id
+    headers = _auth(committed_api_account)
+    barrier = threading.Barrier(2)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        futures = [
+            pool.submit(_post_retry_in_thread, url, headers, barrier)
+            for _ in range(2)
+        ]
+        responses = [future.result(timeout=30) for future in futures]
+
+    codes = sorted(response.status_code for response in responses)
+    assert codes == [200, 409]
+
+    winner = next(response for response in responses if response.status_code == 200)
+    loser = next(response for response in responses if response.status_code == 409)
+    assert winner.json() == {
+        "document_id": str(document_id),
+        "status": "queued",
+        "duplicate": False,
+    }
+    assert loser.json()["error"]["code"] == "INVALID_STATE"
+    assert route_publisher.calls == [(document_id, 0)]
+
+    check = SessionLocal()
+    try:
+        stored = check.get(Document, document_id)
+        assert stored is not None
+        assert stored.status == "queued"
+        assert stored.processing_attempts == 0
+        assert stored.retryable is False
+        assert stored.error_code is None
+        assert stored.error_message is None
+    finally:
+        check.close()
+
+
+def _wait_for_backend_lock_wait(pid: int, timeout: float = 10.0) -> bool:
+    """Wait until a specific PostgreSQL backend is blocked on a lock."""
+    deadline = time.monotonic() + timeout
+    with engine.connect() as observer:
+        while time.monotonic() < deadline:
+            waiting = observer.execute(
+                text(
+                    "SELECT 1 FROM pg_stat_activity "
+                    "WHERE pid = :pid AND wait_event_type = 'Lock'"
+                ),
+                {"pid": pid},
+            ).scalar_one_or_none()
+            if waiting:
+                return True
+            time.sleep(0.01)
+    return False
+
+
+def test_delete_claim_race_has_one_winner_and_no_resurrection(
+    committed_api_account,
+    independent_db,
+    route_storage,
+    monkeypatch,
+):
+    """Hold the delete's row lock while the worker tries to claim.
+
+    The delete must win, the claim must observe zero rows after the row is
+    gone, and neither operation may leave a queued document behind.
+    """
+    document_id, storage_key = _create_committed_document(
+        committed_api_account,
+        status="queued",
+    )
+    route_storage.save(storage_key, PDF_BYTES)
+
+    delete_locked = threading.Event()
+    release_delete = threading.Event()
+    claim_ready = threading.Event()
+    claim_pids: list[int] = []
+
+    original_load = document_routes._load_document
+
+    def blocking_load(db, target_id, membership, *, for_update=False):
+        loaded = original_load(
+            db,
+            target_id,
+            membership,
+            for_update=for_update,
+        )
+        delete_locked.set()
+        if not release_delete.wait(timeout=10):
+            raise RuntimeError("test did not release the delete")
+        return loaded
+
+    monkeypatch.setattr(document_routes, "_load_document", blocking_load)
+
+    url = "/api/v1/documents/%s" % document_id
+    headers = _auth(committed_api_account)
+
+    def delete_request():
+        request_client = TestClient(app, raise_server_exceptions=False)
+        try:
+            return request_client.delete(url, headers=headers)
+        finally:
+            request_client.close()
+
+    def claim_request():
+        session = SessionLocal()
+        try:
+            claim_pids.append(
+                session.execute(text("SELECT pg_backend_pid()")).scalar_one()
+            )
+            claim_ready.set()
+            return claim_document(
+                session,
+                document_id,
+                max_attempts=settings.max_processing_attempts,
+            )
+        finally:
+            session.close()
+
+    try:
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            delete_future = pool.submit(delete_request)
+            try:
+                assert delete_locked.wait(timeout=10)
+
+                claim_future = pool.submit(claim_request)
+                assert claim_ready.wait(timeout=10)
+                lock_waiting = _wait_for_backend_lock_wait(claim_pids[0])
+            finally:
+                # Always let the delete finish, even if a lock assertion
+                # fails, so a broken test cannot hang the suite.
+                release_delete.set()
+
+            assert lock_waiting is True
+            delete_response = delete_future.result(timeout=30)
+            claimed = claim_future.result(timeout=30)
+    finally:
+        release_delete.set()
+
+    assert delete_response.status_code == 204
+    assert claimed is None
+
+    check = SessionLocal()
+    try:
+        assert check.get(Document, document_id) is None
+        runs = list(
+            check.execute(
+                select(ProcessingRun).where(
+                    ProcessingRun.document_id == document_id
+                )
+            ).scalars()
+        )
+        assert runs == []
+    finally:
+        check.close()
+    assert route_storage.exists(storage_key) is False
+
+
+def test_delete_after_claim_returns_409_and_keeps_the_document(
+    committed_api_account,
+    independent_db,
+    route_storage,
+):
+    document_id, storage_key = _create_committed_document(
+        committed_api_account,
+        status="queued",
+    )
+    route_storage.save(storage_key, PDF_BYTES)
+
+    claim_session = SessionLocal()
+    try:
+        claimed = claim_document(
+            claim_session,
+            document_id,
+            max_attempts=settings.max_processing_attempts,
+        )
+    finally:
+        claim_session.close()
+    assert claimed is not None
+
+    r = client.delete(
+        "/api/v1/documents/%s" % document_id,
+        headers=_auth(committed_api_account),
+    )
+    assert r.status_code == 409
+    assert r.json()["error"]["code"] == "INVALID_STATE"
+
+    check = SessionLocal()
+    try:
+        stored = check.get(Document, document_id)
+        assert stored is not None
+        assert stored.status == "processing"
+        assert stored.processing_attempts == 1
+        runs = list(
+            check.execute(
+                select(ProcessingRun).where(
+                    ProcessingRun.document_id == document_id
+                )
+            ).scalars()
+        )
+        assert len(runs) == 1
+        assert runs[0].stage == "claimed"
+    finally:
+        check.close()
+    assert route_storage.exists(storage_key) is True
