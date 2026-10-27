@@ -42,8 +42,12 @@ jobs:
 
       - run: pip install -r backend/requirements-dev.txt
 
-      - name: Apply Alembic migration to real PostgreSQL
-        run: cd backend && alembic upgrade head
+      - name: Apply Alembic migration and verify reversibility
+        run: |
+          cd backend
+          alembic upgrade head
+          alembic downgrade -1
+          alembic upgrade head
 
       - name: Run pytest
         run: cd backend && python -m pytest -q
@@ -54,7 +58,7 @@ jobs:
       - name: Build Docker image
         run: docker compose build
 
-      - name: Smoke-test the API and the worker containers
+      - name: Smoke-test the API, worker, and Beat containers
         # The worker used to exit with code 1 (a missing task module) and
         # nothing reported it: the API does not depend on the worker, and
         # no test imported the module either. `compose up --wait` fails as
@@ -67,9 +71,40 @@ jobs:
           # Create the bind-mount source as the runner user. If Compose
           # creates it instead, Docker owns the host directory as root.
           mkdir -p backend/storage
-          docker compose up -d --wait --wait-timeout 180 api worker
+          docker compose up -d --wait --wait-timeout 180 api worker beat
+
+          # --wait only proves the containers are running. Celery and Beat
+          # print their readiness lines after that, so wait for the text
+          # the smoke check actually asserts.
+          wait_for_log() {
+            service="$1"
+            pattern="$2"
+            for _ in $(seq 1 30); do
+              if docker compose logs "$service" 2>&1 | grep -q "$pattern"; then
+                return 0
+              fi
+              sleep 1
+            done
+            return 1
+          }
+
+          wait_for_log worker "ready\."
+          wait_for_log beat "beat: Starting"
           docker compose logs worker 2>&1 | grep -E "ready\."
+          docker compose logs beat 2>&1 | grep -E "beat: Starting"
           curl -fsS http://127.0.0.1:8000/ready
+
+      - name: Verify worker task registration
+        run: |
+          docker compose exec -T worker celery \
+            -A app.worker.celery_app inspect registered \
+            > /tmp/axiom-registered.txt
+          cat /tmp/axiom-registered.txt
+          grep -q "documents.process" /tmp/axiom-registered.txt
+          grep -q "documents.sweep" /tmp/axiom-registered.txt
+
+      - name: Verify upload to indexed flow end to end
+        run: docker compose exec -T api python scripts/worker_smoke.py
 
       - name: Verify the API and worker share storage
         # A file written by the API must be readable by the worker, which
