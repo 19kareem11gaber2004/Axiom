@@ -45,6 +45,7 @@ from app.worker.pipeline import (
     handle_failure,
 )
 from app.worker.publisher import get_task_publisher
+from app.worker.sweeper import SweepSummary, run_sweeper
 
 logger = logging.getLogger("axiom.worker.tasks")
 
@@ -59,6 +60,7 @@ __all__ = [
     "PROCESS_DOCUMENT_TASK_NAME",
     "SWEEP_DOCUMENTS_TASK_NAME",
     "process_document",
+    "sweep_documents",
 ]
 
 
@@ -272,3 +274,17 @@ def process_document(self, document_id: str) -> str:
         raise
     finally:
         close_session(session)
+
+
+@celery_app.task(
+    ignore_result=True,
+    name=SWEEP_DOCUMENTS_TASK_NAME,
+)
+def sweep_documents() -> SweepSummary:
+    """Recover stale documents under the sweeper's advisory lock.
+
+    The lock and the database session are owned by ``run_sweeper`` so
+    this task stays a thin Beat entry point. A lock contention result is
+    an empty summary, not an error: another worker is already sweeping.
+    """
+    return run_sweeper()

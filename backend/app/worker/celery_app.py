@@ -65,6 +65,14 @@ celery_app.conf.update(
     result_expires=3600,
     worker_max_tasks_per_child=1000,
     worker_max_memory_per_child=200000,  # 200 MB
+    # Beat runs the state-based recovery sweep. The interval is the only
+    # schedule input: the stale cutoffs belong to the sweeper itself.
+    beat_schedule={
+        "sweep-stuck-documents": {
+            "task": "documents.sweep",
+            "schedule": settings.sweeper_interval_seconds,
+        }
+    },
 )
 
 
