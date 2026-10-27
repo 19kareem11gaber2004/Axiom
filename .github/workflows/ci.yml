@@ -40,6 +40,9 @@ jobs:
         with:
           python-version: "3.12"
 
+      - name: Verify the frozen evaluation corpus
+        run: python eval/v0.1/verify.py
+
       - run: pip install -r backend/requirements-dev.txt
 
       - name: Apply Alembic migration and verify reversibility

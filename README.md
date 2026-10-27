@@ -6,11 +6,11 @@ Axiom is an enterprise knowledge platform designed to help organizations ingest,
 
 The project follows an engineering-first approach, prioritizing secure data access, measurable retrieval quality, reliable infrastructure, and incremental delivery over a basic chatbot implementation.
 
-> **Current milestone:** Phase 4 — Background Processing
+> **Current milestone:** Phase 5 — PDF RAG MVP
 >
-> **Current focus:** Durable task publication, database claims, guarded commits, classified retries, and stale-document recovery
+> **Current focus:** Baseline decisions, the frozen `eval/v0.1` corpus, and the provider/chunking/abstention contract that implementation must follow
 >
-> **Application status:** Secure API foundation with durable document ingestion and an asynchronous processing lifecycle; the Phase 4 worker verifies stored bytes and does not extract text or generate embeddings yet. Retrieval and generation are planned, not yet implemented.
+> **Application status:** Phase 4 background processing is complete. The Phase 5 baseline is recorded, but the worker still verifies stored bytes only and does not extract text or generate embeddings yet. Retrieval and generation are planned, not yet implemented.
 
 ---
 
@@ -51,9 +51,9 @@ The platform is being developed incrementally, beginning with a reliable backend
 
 ## Current Status
 
-The current milestone is **Background Processing** (Phase 4): a document committed as `queued` is published to Celery, claimed exactly once, processed outside the claim transaction, committed under a stale-worker guard, and recovered by a Beat-driven sweeper when a message or worker is lost.
+The current milestone is **PDF RAG MVP** (Phase 5). Step 1 is complete: the provider/model boundary, 768-dimensional embedding contract, `retrieval-trace-v1` schema, `pdf-text-v1` chunking rules, two-stage abstention, and the frozen `eval/v0.1` corpus are recorded in [`docs/phase-5/README5.md`](docs/phase-5/README5.md) and ADRs D-025–D-029.
 
-The Phase 4 processor is deliberately an **integrity processor**. It reads the stored object, verifies the uploaded checksum and PDF signature, and returns zero chunks. `indexed` currently means "the processing lifecycle completed"; Phase 5 replaces the processor and backfills the zero-chunk documents before retrieval can treat them as evidence.
+Phase 4 is complete: a document committed as `queued` is published to Celery, claimed exactly once, processed outside the claim transaction, committed under a stale-worker guard, and recovered by a Beat-driven sweeper when a message or worker is lost. Its processor remains the **integrity processor**. It reads the stored object, verifies the uploaded checksum and PDF signature, and returns zero chunks. `indexed` currently means "the processing lifecycle completed"; Phase 5 replaces the processor and backfills the zero-chunk documents before retrieval can treat them as evidence.
 
 | Component | Current scope |
 |---|---|
@@ -168,7 +168,7 @@ Paths that already name the workspace (`/api/v1/workspaces/{id}`, `/api/v1/works
 - Multimodal processing
 - Agentic workflows and human-in-the-loop approval
 
-These capabilities will be introduced in later milestones and verified through explicit acceptance criteria.
+These capabilities will be introduced in later milestones and verified through explicit acceptance criteria. Phase 5 Step 1 records the baseline decisions and freezes the evaluation corpus; it does not add extraction, embedding, retrieval, or generation code.
 
 ---
 
@@ -831,13 +831,19 @@ Axiom/
 │   │   └── README2.md
 │   ├── phase-3/
 │   │   └── README3.md
-│   └── phase-4/
-│       └── README4.md
+│   ├── phase-4/
+│   │   └── README4.md
+│   └── phase-5/
+│       ├── PLAN.md
+│       └── README5.md
 ├── eval/
 │   └── v0.1/
+│       ├── FREEZE.md
+│       ├── MANIFEST.sha256
 │       ├── corpus.lock
 │       ├── schema.json
-│       └── seed-questions.jsonl
+│       ├── seed-questions.jsonl
+│       └── verify.py
 ├── .dockerignore
 ├── .env.example
 ├── .gitignore
@@ -860,14 +866,14 @@ Axiom will progress through incremental milestones with explicit acceptance crit
 | 2 | Backend Foundation | Configuration, persistence, authentication, workspace-scoped authorization, document management, error envelope, CORS, rate limiting | Done |
 | 3 | Document Ingestion | `FileStorage` port and local adapter, workspace-scoped SHA-256 deduplication, upload lifecycle, and shared API/worker storage | Done |
 | 4 | Background Processing | Celery worker and Beat, database claim, guarded commit, classified retries, sweeper, recovery drills | Done |
-| 5 | PDF RAG MVP | PDF extraction, chunking, embeddings, backfill of Phase 4 zero-chunk documents, retrieval, citations, and abstention | Next |
+| 5 | PDF RAG MVP | PDF extraction, chunking, embeddings, backfill of Phase 4 zero-chunk documents, retrieval, citations, and abstention | In progress — baseline and frozen corpus complete; implementation next |
 | 6 | Retrieval Evaluation | Baselines, vector-versus-hybrid comparisons, reranking experiments, and quality metrics | Planned |
 | 7 | Multimodal Retrieval | Evaluated extensions for additional document modalities | Planned |
 | 8 | Agentic Workflows | Controlled tool use, workflow orchestration, and human review where appropriate | Planned |
 
 Phase 6 will build on the PDF MVP rather than expanding the system before a measurable retrieval baseline exists. Its comparisons will be driven by evaluation results instead of assumptions that more complex retrieval is automatically better.
 
-Phase 3 is explained in depth in [`docs/phase-3/README3.md`](docs/phase-3/README3.md); Phase 4 is explained in [`docs/phase-4/README4.md`](docs/phase-4/README4.md); the Phase 2 guide remains at [`docs/phase-2/README2.md`](docs/phase-2/README2.md).
+Phase 3 is explained in depth in [`docs/phase-3/README3.md`](docs/phase-3/README3.md); Phase 4 is explained in [`docs/phase-4/README4.md`](docs/phase-4/README4.md); the Phase 5 baseline is in [`docs/phase-5/README5.md`](docs/phase-5/README5.md); the Phase 2 guide remains at [`docs/phase-2/README2.md`](docs/phase-2/README2.md).
 
 ---
 
@@ -910,7 +916,7 @@ Complete and verify one milestone before adding complexity. Document important a
 - **The file store and database are not atomic.** Uploads write the file before committing the row, and failures are compensated best-effort. A process crash between the file write and the commit can leave an unreferenced object; the current system has no orphan-file collector. Delete has the symmetric crash window: a file removed before a failed commit leaves a row with a missing file until a retry completes the delete.
 - **Only PDF uploads are accepted**, and the upload and integrity processor check only a plain `%PDF-` signature. Page count, character count, and extraction-time limits arrive with real PDF parsing in Phase 5; the worker already has 480 s soft / 600 s hard Celery limits.
 - **No `audit_logs` table yet.** Document deletion writes a structured log line; the permanent audit trail is Phase 10.
-- **The evaluation directory is scaffolding.** It provides a frozen corpus, a schema, and 20 seed questions, but no retrieval or generation quality has been measured.
+- **The evaluation corpus is frozen, but no quality has been measured.** `eval/v0.1` provides the locked sources, schema, 20 seed questions, manifest, and verifier; retrieval and generation metrics are Phase 6 work.
 - **Local credentials and development settings are not suitable for production.** The application refuses to start with the placeholder `JWT_SECRET_KEY` when `ENV` is not `dev`.
 - Container privilege settings, worker execution permissions, and secret handling require verification against the deployed configuration before production use.
 

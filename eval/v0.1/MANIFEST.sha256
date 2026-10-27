@@ -1,0 +1,9 @@
+# Frozen Axiom evaluation corpus v0.1
+# SHA-256 over UTF-8 bytes with CRLF normalized to LF, so the manifest is
+# stable across Windows and Linux checkouts.
+#
+# Changes to any listed file require a new corpus version (v0.2), not an
+# edit in place. See FREEZE.md.
+43bcc97b571b535de07dcb14151a85c32bb5f28028cd9fcc3b961be43cccd8c8  corpus.lock
+d2772162c61e0bcc31994beeb66d49ae9e2c4feb4f8107ea063bb70df6a73227  schema.json
+afe958cc640fd0dc071e3efd04f0f7f8e288fbbe57b98902d542ee53dcfd286d  seed-questions.jsonl
