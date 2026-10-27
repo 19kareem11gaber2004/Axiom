@@ -1,4 +1,4 @@
-"""The document claim: the only entry to ``processing``.
+"""Claim, guarded commit, and failure transitions for document processing.
 
 The contract is defined in ``docs/phase-1/05-job-contract.md``. A task
 payload carries only ``document_id`` (D-017), so the claim first resolves
@@ -18,6 +18,11 @@ Losers return ``None`` with no side effects. The function owns its
 transaction and commits before returning; file I/O happens later, outside
 this transaction, so a slow storage backend never holds a document row
 lock.
+
+The same guarded-update idea protects the commit and failure paths: a
+worker that lost its claim (sweeper recovery followed by a new claim)
+matches zero rows and must roll back rather than overwrite the current
+owner's state.
 """
 
 from __future__ import annotations
@@ -25,18 +30,85 @@ from __future__ import annotations
 import logging
 import uuid
 from dataclasses import dataclass
+from enum import Enum
+from typing import Protocol
 
 from sqlalchemy import delete, func, select, update
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from app.db.models import Chunk, Document, ProcessingRun
 from app.processing.base import ProcessResult
-from app.processing.errors import ChunkConflict
+from app.processing.errors import ChunkConflict, ProcessingError
 
 logger = logging.getLogger("axiom.worker.pipeline")
 
-__all__ = ["ClaimedDocument", "claim_document", "commit_success"]
+__all__ = [
+    "ATTEMPTS_EXHAUSTED",
+    "ATTEMPTS_EXHAUSTED_MESSAGE",
+    "ClaimedDocument",
+    "FailureOutcome",
+    "FailureStatus",
+    "RandomSource",
+    "claim_document",
+    "commit_success",
+    "compute_backoff",
+    "handle_failure",
+]
+
+ATTEMPTS_EXHAUSTED = "ATTEMPTS_EXHAUSTED"
+ATTEMPTS_EXHAUSTED_MESSAGE = (
+    "Document processing failed after the maximum number of attempts."
+)
+
+
+class RandomSource(Protocol):
+    """The one random operation the backoff calculation needs.
+
+    Injecting this small interface instead of calling ``random`` directly
+    makes the retry table deterministic in tests while still accepting a
+    ``random.Random`` instance in production.
+    """
+
+    def uniform(self, low: float, high: float) -> float:
+        """Return a float in the inclusive range ``[low, high]``."""
+
+
+class FailureStatus(str, Enum):
+    """The three possible results of a failed processing attempt."""
+
+    RETRYING = "retrying"
+    FAILED = "failed"
+    STALE = "stale"
+
+
+@dataclass(frozen=True)
+class FailureOutcome:
+    """What the task layer should do after a failure transition.
+
+    ``countdown`` is set only for ``RETRYING``. It is the delay before the
+    fresh task is published; a failed or stale attempt has no next task.
+    """
+
+    status: FailureStatus
+    countdown: float | None = None
+
+
+def compute_backoff(
+    attempt: int,
+    base: float,
+    maximum: float,
+    jitter: float,
+    rng: RandomSource,
+) -> float:
+    """Return the bounded exponential backoff for one claim attempt.
+
+    ``attempt`` is one-based, matching ``processing_attempts``. The jitter
+    is added before the maximum is applied, so the result never exceeds
+    ``maximum`` even with a large random draw.
+    """
+    raw = base * (2 ** (attempt - 1))
+    return min(raw + rng.uniform(0, jitter), maximum)
 
 
 @dataclass(frozen=True)
@@ -283,3 +355,147 @@ def commit_success(
         len(chunk_rows),
     )
     return True
+
+
+def handle_failure(
+    session: Session,
+    claim: ClaimedDocument,
+    error: ProcessingError,
+    max_attempts: int,
+    *,
+    base_seconds: float,
+    maximum_seconds: float,
+    jitter_seconds: float,
+    rng: RandomSource,
+) -> FailureOutcome:
+    """Classify a failed attempt and persist the next document state.
+
+    The classification is:
+
+    * transient with a claim remaining -> ``retrying`` + a publish delay;
+    * transient at the cap -> ``failed`` / ``ATTEMPTS_EXHAUSTED``;
+    * permanent-final -> ``failed`` with ``retryable=false``;
+    * permanent-fixable -> ``failed`` with ``retryable=true``.
+
+    The document update and the run-row close are guarded by the same
+    claim identity. If either matches zero rows, the whole transaction is
+    rolled back and ``STALE`` is returned: another worker or the sweeper
+    owns the latest state. Any SQLAlchemy failure is rolled back and
+    re-raised immediately; this function never tries a second write after
+    a database error.
+    """
+    if error.transient and claim.attempt_no < max_attempts:
+        status = FailureStatus.RETRYING
+        document_status = "retrying"
+        retryable = True
+        run_stage = "retrying"
+        error_code = error.code
+        error_message = error.safe_message
+        countdown: float | None = compute_backoff(
+            claim.attempt_no,
+            base_seconds,
+            maximum_seconds,
+            jitter_seconds,
+            rng,
+        )
+    else:
+        status = FailureStatus.FAILED
+        document_status = "failed"
+        run_stage = "failed"
+        countdown = None
+
+        if error.transient:
+            # The cap is a claim count. The fifth claim has no next
+            # automatic attempt, so no backoff is computed for it.
+            error_code = ATTEMPTS_EXHAUSTED
+            error_message = ATTEMPTS_EXHAUSTED_MESSAGE
+            retryable = False
+        else:
+            error_code = error.code
+            error_message = error.safe_message
+            retryable = error.retryable
+
+    try:
+        updated = session.execute(
+            update(Document)
+            .where(
+                Document.id == claim.id,
+                Document.workspace_id == claim.workspace_id,
+                Document.status.in_(("processing", "retrying")),
+                Document.processing_attempts == claim.attempt_no,
+            )
+            .values(
+                status=document_status,
+                error_code=error_code,
+                error_message=error_message,
+                retryable=retryable,
+                updated_at=func.now(),
+            )
+            .returning(Document.id)
+            .execution_options(synchronize_session=False)
+        ).one_or_none()
+    except SQLAlchemyError:
+        session.rollback()
+        raise
+
+    if updated is None:
+        session.rollback()
+        logger.warning(
+            "document.stale_failure document_id=%s workspace_id=%s "
+            "attempt=%d",
+            claim.id,
+            claim.workspace_id,
+            claim.attempt_no,
+        )
+        return FailureOutcome(status=FailureStatus.STALE)
+
+    try:
+        closed = session.execute(
+            update(ProcessingRun)
+            .where(
+                ProcessingRun.document_id == claim.id,
+                ProcessingRun.workspace_id == claim.workspace_id,
+                ProcessingRun.attempt_no == claim.attempt_no,
+                ProcessingRun.finished_at.is_(None),
+            )
+            .values(
+                stage=run_stage,
+                finished_at=func.now(),
+                error_code=error_code,
+                error_message=error_message,
+            )
+            .returning(ProcessingRun.id)
+            .execution_options(synchronize_session=False)
+        ).one_or_none()
+    except SQLAlchemyError:
+        session.rollback()
+        raise
+
+    if closed is None:
+        # The document update above is part of this transaction and must
+        # not survive when the run row cannot be closed by this worker.
+        session.rollback()
+        logger.warning(
+            "document.stale_failure document_id=%s workspace_id=%s "
+            "attempt=%d",
+            claim.id,
+            claim.workspace_id,
+            claim.attempt_no,
+        )
+        return FailureOutcome(status=FailureStatus.STALE)
+
+    try:
+        session.commit()
+    except SQLAlchemyError:
+        session.rollback()
+        raise
+
+    logger.info(
+        "Document %s failure classified as %s (attempt %d/%d, code=%s).",
+        claim.id,
+        status.value,
+        claim.attempt_no,
+        max_attempts,
+        error_code,
+    )
+    return FailureOutcome(status=status, countdown=countdown)

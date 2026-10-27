@@ -1,10 +1,10 @@
-"""Tests for the Phase 4 claim and processing-run lifecycle.
+"""Tests for the Phase 4 claim, commit, and failure lifecycle.
 
 The claim is the only entry to ``processing`` and must be safe under
 duplicate Celery delivery. These tests exercise it through a real
 PostgreSQL session: the conditional UPDATE, the attempt cap, the run row,
-and the rollback that keeps the document claimable when the run insert
-fails.
+the guarded commit, failure classification, and the rollback that keeps
+the document claimable when the run insert fails.
 
 The shared ``db_session`` fixture joins an outer transaction through a
 savepoint. ``claim_document`` owns its transaction and may roll it back,
@@ -20,7 +20,7 @@ import uuid
 
 import pytest
 from sqlalchemy import event, func, select, update
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import IntegrityError, OperationalError
 
 from app.db.models import (
     Chunk,
@@ -32,12 +32,25 @@ from app.db.models import (
 )
 from app.processing import (
     ChunkConflict,
+    FileMissing,
+    InvalidPdf,
     NewChunk,
     PermanentFinalError,
     ProcessResult,
+    StorageUnavailable,
 )
 from app.storage.keys import storage_key_for
-from app.worker.pipeline import ClaimedDocument, claim_document, commit_success
+from app.worker.pipeline import (
+    ATTEMPTS_EXHAUSTED,
+    ATTEMPTS_EXHAUSTED_MESSAGE,
+    ClaimedDocument,
+    FailureOutcome,
+    FailureStatus,
+    claim_document,
+    commit_success,
+    compute_backoff,
+    handle_failure,
+)
 
 PDF_BYTES = b"%PDF-1.7\n1 0 obj\n<< /Type /Catalog >>\nendobj\n%%EOF\n"
 
@@ -87,6 +100,32 @@ def _stored_chunk(document: Document, chunk_index: int, content: str) -> Chunk:
         embedding_model="test-768",
         embedding_dim=EMBEDDING_DIM,
         embedding=[0.0] * EMBEDDING_DIM,
+    )
+
+
+class _FixedRandom:
+    """A deterministic ``RandomSource`` that records the requested bounds."""
+
+    def __init__(self, value: float = 0.0) -> None:
+        self.value = value
+        self.calls: list[tuple[float, float]] = []
+
+    def uniform(self, low: float, high: float) -> float:
+        self.calls.append((low, high))
+        return self.value
+
+
+def _handle_failure(db_session, claim, error, *, max_attempts=5, rng=None):
+    """Call the real failure handler with the Phase 4 retry settings."""
+    return handle_failure(
+        db_session,
+        claim,
+        error,
+        max_attempts,
+        base_seconds=30,
+        maximum_seconds=900,
+        jitter_seconds=10,
+        rng=_FixedRandom(0) if rng is None else rng,
     )
 
 
@@ -589,3 +628,485 @@ def test_the_run_row_is_closed_exactly_once(db_session):
     assert [chunk.content for chunk in _chunks(db_session, document.id)] == [
         "kept chunk"
     ]
+
+
+# ---------------------------------------------------------------------------
+# Backoff
+# ---------------------------------------------------------------------------
+
+def test_compute_backoff_doubles_the_base_and_adds_jitter():
+    rng = _FixedRandom(4.5)
+
+    assert compute_backoff(1, 30, 900, 10, rng) == 34.5
+    assert compute_backoff(2, 30, 900, 10, rng) == 64.5
+    assert compute_backoff(3, 30, 900, 10, rng) == 124.5
+    assert rng.calls == [(0, 10), (0, 10), (0, 10)]
+
+
+def test_compute_backoff_never_exceeds_the_maximum():
+    rng = _FixedRandom(10)
+
+    # 100 * 2^4 = 1600, plus a full jitter draw, is still capped.
+    assert compute_backoff(5, 100, 900, 10, rng) == 900
+
+
+# ---------------------------------------------------------------------------
+# Failure classification
+# ---------------------------------------------------------------------------
+
+def test_a_transient_failure_schedules_the_next_attempt(db_session):
+    document = _make_document(db_session)
+    claim = claim_document(db_session, document.id, max_attempts=5)
+    assert claim is not None
+
+    rng = _FixedRandom(5)
+    outcome = _handle_failure(
+        db_session,
+        claim,
+        StorageUnavailable(),
+        rng=rng,
+    )
+
+    assert outcome == FailureOutcome(
+        status=FailureStatus.RETRYING,
+        countdown=35,
+    )
+    assert rng.calls == [(0, 10)]
+
+    db_session.refresh(document)
+    assert document.status == "retrying"
+    assert document.processing_attempts == 1
+    assert document.error_code == "STORAGE_UNAVAILABLE"
+    assert document.error_message == StorageUnavailable.safe_message
+    assert document.retryable is True
+    assert document.indexed_at is None
+
+    runs = _runs(db_session, document.id)
+    assert len(runs) == 1
+    assert runs[0].stage == "retrying"
+    assert runs[0].finished_at is not None
+    assert runs[0].error_code == "STORAGE_UNAVAILABLE"
+    assert runs[0].error_message == StorageUnavailable.safe_message
+
+
+def test_transient_failures_back_off_until_the_claim_budget_is_spent(
+    db_session,
+):
+    document = _make_document(db_session)
+    rng = _FixedRandom(0)
+
+    for attempt, delay in enumerate((30, 60, 120, 240), start=1):
+        claim = claim_document(db_session, document.id, max_attempts=5)
+        assert claim is not None
+        assert claim.attempt_no == attempt
+
+        outcome = _handle_failure(
+            db_session,
+            claim,
+            StorageUnavailable(),
+            rng=rng,
+        )
+        assert outcome.status is FailureStatus.RETRYING
+        assert outcome.countdown == delay
+
+    # The fifth claim has no next automatic attempt, so no backoff is
+    # computed for it.
+    claim = claim_document(db_session, document.id, max_attempts=5)
+    assert claim is not None
+    assert claim.attempt_no == 5
+
+    outcome = _handle_failure(
+        db_session,
+        claim,
+        StorageUnavailable(),
+        rng=rng,
+    )
+
+    assert outcome == FailureOutcome(status=FailureStatus.FAILED)
+    assert outcome.countdown is None
+    assert len(rng.calls) == 4
+
+    db_session.refresh(document)
+    assert document.status == "failed"
+    assert document.processing_attempts == 5
+    assert document.error_code == ATTEMPTS_EXHAUSTED
+    assert document.error_message == ATTEMPTS_EXHAUSTED_MESSAGE
+    assert document.retryable is False
+
+    runs = _runs(db_session, document.id)
+    assert [run.attempt_no for run in runs] == [1, 2, 3, 4, 5]
+    assert [run.stage for run in runs] == [
+        "retrying",
+        "retrying",
+        "retrying",
+        "retrying",
+        "failed",
+    ]
+    assert all(run.finished_at is not None for run in runs)
+
+
+def test_a_permanent_final_failure_keeps_its_code_and_is_not_retryable(
+    db_session,
+):
+    document = _make_document(db_session)
+    claim = claim_document(db_session, document.id, max_attempts=5)
+    assert claim is not None
+
+    outcome = _handle_failure(db_session, claim, InvalidPdf())
+
+    assert outcome == FailureOutcome(status=FailureStatus.FAILED)
+    assert outcome.countdown is None
+
+    db_session.refresh(document)
+    assert document.status == "failed"
+    assert document.processing_attempts == 1
+    assert document.error_code == "INVALID_PDF"
+    assert document.error_message == InvalidPdf.safe_message
+    assert document.retryable is False
+
+    runs = _runs(db_session, document.id)
+    assert len(runs) == 1
+    assert runs[0].stage == "failed"
+    assert runs[0].finished_at is not None
+    assert runs[0].error_code == "INVALID_PDF"
+
+
+def test_a_permanent_fixable_failure_is_failed_but_manually_retryable(
+    db_session,
+):
+    # The cap only replaces a transient error with ATTEMPTS_EXHAUSTED; a
+    # permanent-fixable error keeps its own code and retry flag even on
+    # the final claim.
+    document = _make_document(
+        db_session,
+        status="retrying",
+        processing_attempts=4,
+        retryable=True,
+    )
+    claim = claim_document(db_session, document.id, max_attempts=5)
+    assert claim is not None
+    assert claim.attempt_no == 5
+
+    outcome = _handle_failure(db_session, claim, FileMissing())
+
+    assert outcome == FailureOutcome(status=FailureStatus.FAILED)
+    assert outcome.countdown is None
+
+    db_session.refresh(document)
+    assert document.status == "failed"
+    assert document.processing_attempts == 5
+    assert document.error_code == "FILE_MISSING"
+    assert document.error_message == FileMissing.safe_message
+    assert document.retryable is True
+
+    runs = _runs(db_session, document.id)
+    assert len(runs) == 1
+    assert runs[0].stage == "failed"
+    assert runs[0].finished_at is not None
+    assert runs[0].error_code == "FILE_MISSING"
+
+
+# ---------------------------------------------------------------------------
+# Stale failure transitions
+# ---------------------------------------------------------------------------
+
+def test_a_failure_after_a_newer_claim_is_stale(db_session, caplog):
+    document = _make_document(db_session)
+    first_claim = claim_document(db_session, document.id, max_attempts=5)
+    assert first_claim is not None
+
+    # The sweeper recovered the first worker: retrying, first run closed.
+    db_session.execute(
+        update(Document)
+        .where(Document.id == document.id)
+        .values(status="retrying", retryable=True, updated_at=func.now())
+    )
+    db_session.execute(
+        update(ProcessingRun)
+        .where(
+            ProcessingRun.document_id == document.id,
+            ProcessingRun.attempt_no == first_claim.attempt_no,
+        )
+        .values(
+            stage="timeout",
+            finished_at=func.now(),
+            error_code="PROCESSING_TIMEOUT",
+        )
+    )
+    db_session.commit()
+
+    second_claim = claim_document(db_session, document.id, max_attempts=5)
+    assert second_claim is not None
+    assert second_claim.attempt_no == 2
+
+    with caplog.at_level(logging.WARNING, logger="axiom.worker.pipeline"):
+        outcome = _handle_failure(
+            db_session,
+            first_claim,
+            StorageUnavailable(),
+        )
+
+    assert outcome == FailureOutcome(status=FailureStatus.STALE)
+    assert outcome.countdown is None
+
+    db_session.refresh(document)
+    assert document.status == "processing"
+    assert document.processing_attempts == 2
+    assert document.error_code is None
+    assert document.error_message is None
+    assert document.retryable is False
+
+    runs = _runs(db_session, document.id)
+    assert len(runs) == 2
+    first_run = next(run for run in runs if run.attempt_no == 1)
+    second_run = next(run for run in runs if run.attempt_no == 2)
+    assert first_run.stage == "timeout"
+    assert first_run.finished_at is not None
+    assert second_run.stage == "claimed"
+    assert second_run.finished_at is None
+
+    assert any(
+        "document.stale_failure" in record.getMessage()
+        for record in caplog.records
+    )
+
+
+def test_a_failure_whose_run_row_is_already_closed_is_stale(
+    db_session,
+    caplog,
+):
+    document = _make_document(db_session)
+    claim = claim_document(db_session, document.id, max_attempts=5)
+    assert claim is not None
+
+    # The document still looks owned by this claim, but its run row is
+    # already closed. The document update must be rolled back with it.
+    db_session.execute(
+        update(ProcessingRun)
+        .where(
+            ProcessingRun.document_id == document.id,
+            ProcessingRun.attempt_no == claim.attempt_no,
+        )
+        .values(stage="timeout", finished_at=func.now())
+    )
+    db_session.commit()
+
+    with caplog.at_level(logging.WARNING, logger="axiom.worker.pipeline"):
+        outcome = _handle_failure(
+            db_session,
+            claim,
+            StorageUnavailable(),
+        )
+
+    assert outcome == FailureOutcome(status=FailureStatus.STALE)
+    assert outcome.countdown is None
+
+    db_session.refresh(document)
+    assert document.status == "processing"
+    assert document.processing_attempts == 1
+    assert document.error_code is None
+    assert document.retryable is False
+
+    runs = _runs(db_session, document.id)
+    assert len(runs) == 1
+    assert runs[0].stage == "timeout"
+    assert runs[0].finished_at is not None
+
+    assert any(
+        "document.stale_failure" in record.getMessage()
+        for record in caplog.records
+    )
+
+
+# ---------------------------------------------------------------------------
+# Database errors are never hidden
+# ---------------------------------------------------------------------------
+
+def test_a_document_update_error_is_rolled_back_and_reraised(
+    db_session,
+    monkeypatch,
+):
+    document = _make_document(db_session)
+    claim = claim_document(db_session, document.id, max_attempts=5)
+    assert claim is not None
+
+    original_execute = db_session.execute
+    original_rollback = db_session.rollback
+    execute_calls = []
+    rollbacks = []
+
+    def failing_execute(*args, **kwargs):
+        execute_calls.append(True)
+        raise OperationalError(
+            "UPDATE documents",
+            {},
+            RuntimeError("connection lost"),
+        )
+
+    def tracking_rollback():
+        rollbacks.append(True)
+        original_rollback()
+
+    monkeypatch.setattr(db_session, "execute", failing_execute)
+    monkeypatch.setattr(db_session, "rollback", tracking_rollback)
+
+    with pytest.raises(OperationalError):
+        _handle_failure(db_session, claim, StorageUnavailable())
+
+    # The handler must not try the run update or a commit after the first
+    # database failure.
+    assert len(execute_calls) == 1
+    assert rollbacks == [True]
+
+    row = original_execute(
+        select(
+            Document.status,
+            Document.processing_attempts,
+            Document.error_code,
+            Document.retryable,
+        ).where(Document.id == document.id)
+    ).one()
+    assert row.status == "processing"
+    assert row.processing_attempts == 1
+    assert row.error_code is None
+    assert row.retryable is False
+
+    run = original_execute(
+        select(ProcessingRun.stage, ProcessingRun.finished_at).where(
+            ProcessingRun.document_id == document.id,
+            ProcessingRun.attempt_no == claim.attempt_no,
+        )
+    ).one()
+    assert run.stage == "claimed"
+    assert run.finished_at is None
+
+
+def test_a_run_update_error_rolls_back_the_document_update(
+    db_session,
+    monkeypatch,
+):
+    document = _make_document(db_session)
+    claim = claim_document(db_session, document.id, max_attempts=5)
+    assert claim is not None
+
+    original_execute = db_session.execute
+    original_rollback = db_session.rollback
+    original_commit = db_session.commit
+    execute_calls = []
+    commits = []
+    rollbacks = []
+
+    def flaky_execute(*args, **kwargs):
+        execute_calls.append(True)
+        if len(execute_calls) == 2:
+            raise OperationalError(
+                "UPDATE processing_runs",
+                {},
+                RuntimeError("connection lost"),
+            )
+        return original_execute(*args, **kwargs)
+
+    def tracking_commit():
+        commits.append(True)
+        original_commit()
+
+    def tracking_rollback():
+        rollbacks.append(True)
+        original_rollback()
+
+    monkeypatch.setattr(db_session, "execute", flaky_execute)
+    monkeypatch.setattr(db_session, "commit", tracking_commit)
+    monkeypatch.setattr(db_session, "rollback", tracking_rollback)
+
+    with pytest.raises(OperationalError):
+        _handle_failure(db_session, claim, StorageUnavailable())
+
+    assert len(execute_calls) == 2
+    assert commits == []
+    assert rollbacks == [True]
+
+    row = original_execute(
+        select(
+            Document.status,
+            Document.processing_attempts,
+            Document.error_code,
+            Document.retryable,
+        ).where(Document.id == document.id)
+    ).one()
+    assert row.status == "processing"
+    assert row.processing_attempts == 1
+    assert row.error_code is None
+    assert row.retryable is False
+
+    run = original_execute(
+        select(ProcessingRun.stage, ProcessingRun.finished_at).where(
+            ProcessingRun.document_id == document.id,
+            ProcessingRun.attempt_no == claim.attempt_no,
+        )
+    ).one()
+    assert run.stage == "claimed"
+    assert run.finished_at is None
+
+
+def test_a_commit_error_is_rolled_back_and_reraised(
+    db_session,
+    monkeypatch,
+):
+    document = _make_document(db_session)
+    claim = claim_document(db_session, document.id, max_attempts=5)
+    assert claim is not None
+
+    original_execute = db_session.execute
+    original_rollback = db_session.rollback
+    execute_calls = []
+    commit_calls = []
+    rollbacks = []
+
+    def counting_execute(*args, **kwargs):
+        execute_calls.append(True)
+        return original_execute(*args, **kwargs)
+
+    def failing_commit():
+        commit_calls.append(True)
+        raise OperationalError(
+            "COMMIT",
+            {},
+            RuntimeError("connection lost"),
+        )
+
+    def tracking_rollback():
+        rollbacks.append(True)
+        original_rollback()
+
+    monkeypatch.setattr(db_session, "execute", counting_execute)
+    monkeypatch.setattr(db_session, "commit", failing_commit)
+    monkeypatch.setattr(db_session, "rollback", tracking_rollback)
+
+    with pytest.raises(OperationalError):
+        _handle_failure(db_session, claim, StorageUnavailable())
+
+    assert len(execute_calls) == 2
+    assert commit_calls == [True]
+    assert rollbacks == [True]
+
+    row = original_execute(
+        select(
+            Document.status,
+            Document.processing_attempts,
+            Document.error_code,
+            Document.retryable,
+        ).where(Document.id == document.id)
+    ).one()
+    assert row.status == "processing"
+    assert row.processing_attempts == 1
+    assert row.error_code is None
+    assert row.retryable is False
+
+    run = original_execute(
+        select(ProcessingRun.stage, ProcessingRun.finished_at).where(
+            ProcessingRun.document_id == document.id,
+            ProcessingRun.attempt_no == claim.attempt_no,
+        )
+    ).one()
+    assert run.stage == "claimed"
+    assert run.finished_at is None
