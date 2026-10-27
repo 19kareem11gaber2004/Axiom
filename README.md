@@ -6,11 +6,11 @@ Axiom is an enterprise knowledge platform designed to help organizations ingest,
 
 The project follows an engineering-first approach, prioritizing secure data access, measurable retrieval quality, reliable infrastructure, and incremental delivery over a basic chatbot implementation.
 
-> **Current milestone:** Phase 3 — Document Ingestion
+> **Current milestone:** Phase 4 — Background Processing
 >
-> **Current focus:** Durable file storage, workspace-scoped duplicate detection, and the upload lifecycle
+> **Current focus:** Durable task publication, database claims, guarded commits, classified retries, and stale-document recovery
 >
-> **Application status:** Secure API foundation with durable document ingestion; retrieval and generation are planned, not yet implemented.
+> **Application status:** Secure API foundation with durable document ingestion and an asynchronous processing lifecycle; the Phase 4 worker verifies stored bytes and does not extract text or generate embeddings yet. Retrieval and generation are planned, not yet implemented.
 
 ---
 
@@ -51,21 +51,24 @@ The platform is being developed incrementally, beginning with a reliable backend
 
 ## Current Status
 
-The current milestone is **Document Ingestion** (Phase 3): a secure, workspace-scoped API that stores uploaded PDFs durably, detects duplicate content, and hands a readable file to the future worker.
+The current milestone is **Background Processing** (Phase 4): a document committed as `queued` is published to Celery, claimed exactly once, processed outside the claim transaction, committed under a stale-worker guard, and recovered by a Beat-driven sweeper when a message or worker is lost.
+
+The Phase 4 processor is deliberately an **integrity processor**. It reads the stored object, verifies the uploaded checksum and PDF signature, and returns zero chunks. `indexed` currently means "the processing lifecycle completed"; Phase 5 replaces the processor and backfills the zero-chunk documents before retrieval can treat them as evidence.
 
 | Component | Current scope |
 |---|---|
 | FastAPI | Application, structured error envelope, request IDs, 13 versioned operations across 10 paths under `/api/v1` |
-| PostgreSQL + pgvector | Persistent storage, workspace-scoped schema, vector column |
+| PostgreSQL + pgvector | Persistent storage, workspace-scoped schema, vector column, document lifecycle state |
 | SQLAlchemy | 9 models, composite foreign keys enforcing workspace isolation |
-| Alembic | Version-controlled migrations (revision `0001`, verified on a real pgvector server); Phase 3 needs no new migration |
-| Redis | Broker infrastructure **and** login rate limiting |
-| Celery | Asynchronous task-processing foundation; document tasks arrive in Phase 4 |
+| Alembic | Version-controlled migrations (`0001` initial schema, `0002` retryable state and sweeper index), verified for upgrade/downgrade on a real pgvector server |
+| Redis | Three logical databases: DB 0 login rate limiting, DB 1 Celery broker, DB 2 Celery result backend (results ignored) |
+| Celery worker | `documents.process`: claim, process, guarded commit, classified failure, fresh retry publish |
+| Celery Beat | `documents.sweep` every 60 seconds under a PostgreSQL advisory lock |
 | File storage | `FileStorage` port with a local atomic adapter; the API and worker share a Compose bind mount |
-| Deduplication | Workspace-scoped SHA-256, advisory; new uploads `202`, duplicates `200` |
-| Docker Compose | Local multi-service environment |
-| Pytest | 351 tests: unit, HTTP, and real PostgreSQL/Redis integration |
-| GitHub Actions | Automated CI workflow (migration, tests, compose validation, image build, shared-storage smoke check) |
+| Deduplication | Workspace-scoped SHA-256, advisory; new uploads `202`, duplicates `200`, duplicates are not published |
+| Docker Compose | Local multi-service environment: PostgreSQL, Redis, API, worker, Beat |
+| Pytest | 503 tests: unit, HTTP, real PostgreSQL/Redis integration, and recovery drills |
+| GitHub Actions | Migration reversibility, full pytest, Compose validation, image build, Compose database migration, container smoke test, task registration, worker end-to-end flow, shared-storage check |
 
 ### Implemented endpoints
 
@@ -97,7 +100,52 @@ Every error uses one envelope: `{"error": {"code", "message", "retryable", "requ
 
 A duplicate is a successful lookup, not an error. It does **not** create a new file or row, and it does not change the existing document's metadata or status. Deduplication is **advisory**: two concurrent identical uploads can both create documents. The resulting `duplicate` field is part of the upload response, and both `200` and `202` are documented in the OpenAPI schema.
 
-For the design rationale, the storage port, transaction ordering, and exercises, see [`docs/phase-3/README3.md`](docs/phase-3/README3.md).
+A new document is committed as `queued` and then published to the worker. A duplicate is not published: returning the existing row and starting another task for the same bytes would create duplicate work for a document that may already be indexed. If the broker is unavailable, the upload still succeeds because the row is durable; the sweeper republishes it later.
+
+For the Phase 3 design rationale, the storage port, and transaction ordering, see [`docs/phase-3/README3.md`](docs/phase-3/README3.md). For the Phase 4 lifecycle, claim/commit SQL, failure taxonomy, and recovery drills, see [`docs/phase-4/README4.md`](docs/phase-4/README4.md).
+
+### Background processing
+
+A document moves through this lifecycle:
+
+```text
+POST /documents -> queued -> processing -> indexed
+                       ^          |
+                       |          +-> retrying -> processing -> indexed
+                       |          |
+                       +----------+-> failed (permanent or attempts exhausted)
+```
+
+- **Claim.** The worker performs a conditional `UPDATE ... WHERE status IN ('queued','retrying') AND processing_attempts < max_attempts RETURNING ...` and inserts a `processing_runs` row in the same transaction. Exactly one worker wins; duplicate delivery is a no-op for the loser.
+- **Process.** The integrity processor reads the stored object outside the claim transaction, verifies its checksum and PDF signature, and returns no chunks.
+- **Commit.** The worker replaces the chunk set and marks the document `indexed` only if the row is still owned by the same attempt. A stale worker's commit rolls back.
+- **Retry.** A transient failure moves the document to `retrying`, closes the run row, and publishes a fresh task with exponential backoff. A permanent failure moves it to `failed` with a persisted `retryable` flag.
+- **Manual retry.** `POST /documents/{id}/retry` accepts only `failed` and `retryable` documents. It sets `queued` without incrementing `processing_attempts`; the next claim consumes the attempt.
+- **Recovery.** Beat runs `documents.sweep` every 60 seconds. The sweeper republishes stale `queued`/`retrying` rows, moves stale `uploaded` rows to `queued`, and turns stale `processing` rows into `retrying` or `failed` at the attempt cap.
+
+The worker runs as a separate non-root Compose service with `task_acks_late=True`, `worker_prefetch_multiplier=1`, a 480 s soft limit, a 600 s hard limit, and a 1800 s visibility timeout. PostgreSQL is the source of truth; Redis only transports tasks.
+
+### Phase 4 configuration
+
+| Variable | Default | Effect |
+|---|---|---|
+| `MAX_PROCESSING_ATTEMPTS` | `5` | Claims allowed per document; manual retries do not consume the budget |
+| `PROCESSING_RETRY_BASE_SECONDS` | `30` | Exponential backoff base |
+| `PROCESSING_RETRY_MAX_SECONDS` | `900` | Backoff ceiling after jitter |
+| `PROCESSING_RETRY_JITTER_SECONDS` | `10` | Uniform jitter added before the ceiling |
+| `SWEEPER_INTERVAL_SECONDS` | `60` | Beat schedule for `documents.sweep` |
+| `SWEEPER_UPLOADED_STALE_SECONDS` | `300` | Age before `uploaded -> queued` |
+| `SWEEPER_QUEUED_STALE_SECONDS` | `600` | Age before a queued row is republished or failed at cap |
+| `SWEEPER_RETRYING_STALE_SECONDS` | `600` | Age before a retrying row is republished or failed at cap |
+| `SWEEPER_PROCESSING_STALE_SECONDS` | `900` | Age before a processing row is treated as a dead worker |
+| `SWEEPER_BATCH_SIZE` | `100` | Rows per stale category per sweep |
+| `CELERY_BROKER_URL` | Redis DB 1 | Celery broker; derived from `REDIS_URL` when blank |
+| `CELERY_RESULT_BACKEND` | Redis DB 2 | Celery result backend; results are ignored but the backend is explicit |
+| `CELERY_TASK_SOFT_TIME_LIMIT_SECONDS` | `480` | Soft task limit; becomes `PROCESSING_TIMEOUT` |
+| `CELERY_TASK_TIME_LIMIT_SECONDS` | `600` | Hard task limit |
+| `CELERY_VISIBILITY_TIMEOUT_SECONDS` | `1800` | Broker redelivery timeout |
+
+The application refuses to start when `soft < hard < visibility` is violated or when the processing stale threshold is not greater than the hard limit. These relationships keep a live task from being redelivered or swept while it is still running. Host runs read the unprefixed names from `.env`; inside Compose, the Phase 4 tunables keep their defaults unless they are added to the forwarded environment block or passed with `-e`.
 
 ### Choosing a workspace
 
@@ -111,8 +159,9 @@ Paths that already name the workspace (`/api/v1/workspaces/{id}`, `/api/v1/works
 
 ### Not implemented yet
 
-- Background document processing (the Celery worker and PDF extraction)
-- Chunking, embedding generation, and retrieval
+- PDF text extraction and page-aware chunking (the Phase 4 worker verifies bytes only)
+- Embedding generation and vector retrieval
+- Backfilling the zero-chunk documents indexed by the Phase 4 integrity processor
 - RAG answer generation and citation validation
 - Conversations and chat
 - Hybrid retrieval and reranking
@@ -128,36 +177,45 @@ These capabilities will be introduced in later milestones and verified through e
 Axiom begins as a **modular monolith**: one backend application with clearly separated internal responsibilities, supported by dedicated infrastructure services.
 
 ```text
-                    Client Applications
-                            |
-                            v
-                      FastAPI API
-                            |
-             +--------------+--------------+
-             |              |              |
-             v              v              v
-        PostgreSQL        Redis       FileStorage
-        + pgvector          |       (local root or
-             ^              v        bind mount)
-             |        Celery Worker
-             |              |
-             +--------------+
-                  Shared infrastructure
+                         Client Applications
+                                 |
+                                 v
+                           FastAPI API
+                                 |
+             +-------------------+-------------------+
+             |                   |                   |
+             v                   v                   v
+      PostgreSQL           Redis DB 0          FileStorage
+      + pgvector          login limiter      (local root or
+             ^                   |             bind mount)
+             |                   |                   ^
+             |                   v                   |
+             |            Redis DB 1 (broker)        |
+             |                   |                   |
+             |                   v                   |
+             |            Celery Worker ------------+
+             |                   ^
+             |                   |
+             |            Celery Beat
+             |         (documents.sweep)
+             |
+             +------ claim / commit / runs
 ```
 
-The diagram represents the infrastructure relationships at a high level. Document-processing and retrieval workflows will be added in subsequent milestones.
+Redis DB 2 is the Celery result backend. It is configured explicitly so Celery never falls back to another transport, but the lifecycle ignores results; PostgreSQL is the system of record. Retrieval and generation will be added in later milestones.
 
 ### Architectural responsibilities
 
-- **API layer:** Exposes HTTP endpoints, authenticates callers, and maps domain errors to the common envelope.
-- **Database layer:** Persists application data, workspace memberships, document metadata, and vector-ready tables.
-- **File storage layer:** Stores original bytes behind the `FileStorage` port; `LocalFileStorage` is the Phase 3 adapter, and the API and worker share the same root.
-- **Message broker:** Redis provides the transport infrastructure for background tasks.
-- **Worker layer:** Celery provides the execution environment for asynchronous jobs; document tasks arrive in Phase 4.
-- **Migration layer:** Alembic manages version-controlled database schema changes.
-- **CI pipeline:** Validates migrations, tests, configuration, the backend image, and shared API/worker storage.
+- **API layer:** Exposes HTTP endpoints, authenticates callers, commits upload state, publishes best-effort tasks, and maps domain errors to the common envelope.
+- **Database layer:** Persists application data, workspace memberships, document metadata, processing runs, chunks, and vector-ready tables.
+- **File storage layer:** Stores original bytes behind the `FileStorage` port; `LocalFileStorage` is the only adapter, and the API and worker share the same root.
+- **Message broker:** Redis Database 1 transports Celery tasks; Database 2 is the result backend, and Database 0 is reserved for login rate limiting.
+- **Worker layer:** Celery claims documents, runs the processor outside the transaction, commits under an attempt guard, and classifies failures.
+- **Scheduler layer:** Celery Beat enqueues the stale-document sweeper under a PostgreSQL advisory lock.
+- **Migration layer:** Alembic manages version-controlled database schema changes, including the Phase 4 retryable state and sweeper index.
+- **CI pipeline:** Validates migration reversibility, tests, Compose configuration, the backend image, task registration, the end-to-end upload-to-indexed flow, and shared API/worker storage.
 
-The initial migration is intended to establish nine application tables, together with the required PostgreSQL extension, enum types, constraints, and indexes. The actual migration must be executed successfully against PostgreSQL to verify the resulting schema.
+The schema has nine application tables, together with the required PostgreSQL extension, enum types, constraints, and indexes. Revision `0002` adds `documents.retryable` and the `(status, updated_at)` index the sweeper scans; both migrations have been executed against PostgreSQL with upgrade/downgrade checks.
 
 ---
 
@@ -173,8 +231,9 @@ The initial migration is intended to establish nine application tables, together
 | Migrations | Alembic | Schema versioning |
 | File storage | `FileStorage` port + local adapter | Durable upload bytes with an object-store seam |
 | Deduplication | Workspace-scoped SHA-256 | Advisory content identity for idempotent uploads |
-| Message broker | Redis | Background-task transport |
-| Task processing | Celery | Asynchronous job execution |
+| Message broker | Redis | Background-task transport (DB 1) and result backend (DB 2) |
+| Task processing | Celery | Asynchronous job execution and retry publication |
+| Scheduling | Celery Beat | Periodic stale-document sweeper |
 | Containerization | Docker | Reproducible application environment |
 | Orchestration | Docker Compose | Local multi-service development |
 | Testing | Pytest | Automated verification |
@@ -304,8 +363,10 @@ A successful migration is required before the application can rely on the schema
 If the API runs in Docker, run the migration inside the Compose network instead, so it reaches the same database the API uses:
 
 ```powershell
-docker compose run --rm api alembic upgrade head
+docker compose run --rm --no-deps api alembic upgrade head
 ```
+
+This runs against the Compose PostgreSQL service, which is the same database the API and worker use. `--no-deps` is safe because the migration command only needs PostgreSQL, which step 3 already started.
 
 ### 5a. Create the first administrator
 
@@ -333,23 +394,23 @@ python -c "import secrets; print(secrets.token_urlsafe(48))"
 
 Put the result in `JWT_SECRET_KEY` in `.env` (host workflow) or in `AXIOM_JWT_SECRET_KEY` for the Compose workflow. The application **refuses to start** with the placeholder secret when `ENV` is not `dev`.
 
-### 6. Start the API and worker
+### 6. Start the API, worker, and scheduler
 
 Build the backend image and start the application services:
 
 ```powershell
-docker compose up --build api worker
+docker compose up --build api worker beat
 ```
 
-The services run in the foreground, allowing you to inspect their logs.
+The services run in the foreground, allowing you to inspect their logs. Beat is a separate service because the sweeper must run even when no API request or worker task is active.
 
 To start them in the background instead:
 
 ```powershell
-docker compose up -d --build api worker
+docker compose up -d --build api worker beat
 ```
 
-Or start the whole stack (PostgreSQL, Redis, API, worker) in one command:
+Or start the whole stack (PostgreSQL, Redis, API, worker, Beat) in one command:
 
 ```powershell
 docker compose up -d --build
@@ -520,7 +581,7 @@ python -m pytest -q
 Set-Location ..
 ```
 
-The suite contains 351 tests. Tests that need PostgreSQL or Redis are **skipped** when those services are unreachable, so the suite still runs offline:
+The suite contains 503 tests. Tests that need PostgreSQL or Redis are **skipped** when those services are unreachable, so the suite still runs offline. Database-backed worker tests include real claim concurrency, guarded commits, sweeper transitions, and the no-Redis recovery path:
 
 ```powershell
 Set-Location backend
@@ -642,18 +703,22 @@ The GitHub Actions workflow is located at:
 .github/workflows/ci.yml
 ```
 
-It is designed to validate the project on pushes and pull requests.
+It validates the project on pushes and pull requests.
 
-The intended pipeline includes:
+The workflow includes:
 
 1. Provisioning PostgreSQL with pgvector and Redis service containers.
 2. Setting up Python 3.12.
 3. Installing development dependencies.
-4. Applying Alembic migrations.
-5. Running automated tests.
+4. Applying Alembic migrations and verifying downgrade/upgrade reversibility.
+5. Running the full automated test suite.
 6. Validating the Docker Compose configuration.
 7. Building the backend Docker image.
-8. Verifying that the API and worker can read and write the same storage root.
+8. Migrating the separate Compose PostgreSQL database before startup.
+9. Starting the API, worker, and Beat and waiting for their readiness logs.
+10. Verifying that `documents.process` and `documents.sweep` are registered.
+11. Running the end-to-end upload-to-indexed worker smoke test.
+12. Verifying that the API and worker can read and write the same storage root.
 
 CI helps identify regressions before changes are merged. It does not automatically repair faulty code or guarantee production readiness.
 
@@ -672,7 +737,8 @@ Axiom/
 │   ├── alembic/
 │   │   ├── env.py
 │   │   └── versions/
-│   │       └── 0001_v01_init.py
+│   │       ├── 0001_v01_init.py
+│   │       └── 0002_phase4_background_processing.py
 │   ├── app/
 │   │   ├── ai_workflow/
 │   │   ├── api/
@@ -694,6 +760,10 @@ Axiom/
 │   │   ├── ingestion/
 │   │   │   ├── service.py
 │   │   │   └── validation.py
+│   │   ├── processing/
+│   │   │   ├── base.py
+│   │   │   ├── errors.py
+│   │   │   └── integrity.py
 │   │   ├── retrieval/
 │   │   ├── storage/
 │   │   │   ├── __init__.py
@@ -702,12 +772,18 @@ Axiom/
 │   │   │   └── local.py
 │   │   ├── worker/
 │   │   │   ├── celery_app.py
+│   │   │   ├── pipeline.py
+│   │   │   ├── publisher.py
+│   │   │   ├── sweeper.py
 │   │   │   └── tasks.py
 │   │   ├── config.py
 │   │   └── main.py
+│   ├── scripts/
+│   │   └── worker_smoke.py
 │   ├── tests/
 │   │   ├── conftest.py
 │   │   ├── fakes/
+│   │   │   ├── publisher.py
 │   │   │   └── storage.py
 │   │   ├── test_auth_api.py
 │   │   ├── test_auth_dependencies.py
@@ -723,13 +799,19 @@ Axiom/
 │   │   ├── test_lifespan.py
 │   │   ├── test_migration_sql.py
 │   │   ├── test_openapi.py
+│   │   ├── test_processing_integrity.py
+│   │   ├── test_publisher.py
 │   │   ├── test_rate_limit.py
 │   │   ├── test_readiness.py
 │   │   ├── test_ready.py
 │   │   ├── test_smoke_integration.py
 │   │   ├── test_storage.py
 │   │   ├── test_storage_port.py
+│   │   ├── test_sweeper.py
 │   │   ├── test_worker.py
+│   │   ├── test_worker_claim_concurrency.py
+│   │   ├── test_worker_pipeline.py
+│   │   ├── test_worker_recovery.py
 │   │   └── test_workspaces.py
 │   ├── .dockerignore
 │   ├── Dockerfile
@@ -747,8 +829,10 @@ Axiom/
 │   │   └── 07-decision-log.md
 │   ├── phase-2/
 │   │   └── README2.md
-│   └── phase-3/
-│       └── README3.md
+│   ├── phase-3/
+│   │   └── README3.md
+│   └── phase-4/
+│       └── README4.md
 ├── eval/
 │   └── v0.1/
 │       ├── corpus.lock
@@ -775,15 +859,15 @@ Axiom will progress through incremental milestones with explicit acceptance crit
 | 1 | Walking Skeleton | Application startup, infrastructure, migrations, health checks, tests, and CI | Done |
 | 2 | Backend Foundation | Configuration, persistence, authentication, workspace-scoped authorization, document management, error envelope, CORS, rate limiting | Done |
 | 3 | Document Ingestion | `FileStorage` port and local adapter, workspace-scoped SHA-256 deduplication, upload lifecycle, and shared API/worker storage | Done |
-| 4 | Background Processing | Celery worker, database claim, sweeper, retries, and failure recovery | Next |
-| 5 | PDF RAG MVP | PDF extraction, chunking, embeddings, retrieval, citations, and abstention | Planned |
+| 4 | Background Processing | Celery worker and Beat, database claim, guarded commit, classified retries, sweeper, recovery drills | Done |
+| 5 | PDF RAG MVP | PDF extraction, chunking, embeddings, backfill of Phase 4 zero-chunk documents, retrieval, citations, and abstention | Next |
 | 6 | Retrieval Evaluation | Baselines, vector-versus-hybrid comparisons, reranking experiments, and quality metrics | Planned |
 | 7 | Multimodal Retrieval | Evaluated extensions for additional document modalities | Planned |
 | 8 | Agentic Workflows | Controlled tool use, workflow orchestration, and human review where appropriate | Planned |
 
 Phase 6 will build on the PDF MVP rather than expanding the system before a measurable retrieval baseline exists. Its comparisons will be driven by evaluation results instead of assumptions that more complex retrieval is automatically better.
 
-Phase 3 is explained in depth in [`docs/phase-3/README3.md`](docs/phase-3/README3.md); the Phase 2 guide remains at [`docs/phase-2/README2.md`](docs/phase-2/README2.md).
+Phase 3 is explained in depth in [`docs/phase-3/README3.md`](docs/phase-3/README3.md); Phase 4 is explained in [`docs/phase-4/README4.md`](docs/phase-4/README4.md); the Phase 2 guide remains at [`docs/phase-2/README2.md`](docs/phase-2/README2.md).
 
 ---
 
@@ -812,7 +896,11 @@ Complete and verify one milestone before adding complexity. Document important a
 ## Current Limitations
 
 - Axiom is currently a secure API foundation, not a functioning RAG application. No answer is generated yet.
-- **No background processing.** Uploads are validated, stored, and queued, but no Celery task consumes the queue: documents stay in `queued` until document-processing tasks land in Phase 4.
+- **The worker does not index documents yet.** Phase 4 runs an integrity processor: it re-reads the stored object, verifies the checksum and PDF signature, and returns zero chunks. It does not extract text, count pages, chunk, or embed.
+- **`indexed` does not guarantee searchable content.** Every document indexed by Phase 4 has zero chunks. Phase 5 must replace the processor and backfill those documents before retrieval can treat `indexed` as evidence.
+- **Recovery is periodic, not immediate.** A lost publish is repaired by the sweeper after the relevant stale threshold (10 minutes for `queued`/`retrying`, 15 minutes for `processing` by default), and Beat only runs every 60 seconds. The state-based sweeper is a deliberate alternative to a transactional outbox, so the guarantee is eventual recovery rather than instantaneous redelivery.
+- **Processing is at least once.** Redis may deliver the same task more than once, and a worker may be killed after committing but before acknowledging. The claim and guarded commit make duplicate delivery harmless; they do not prevent duplicate delivery.
+- **Manual retries share the claim budget.** The retry endpoint does not increment `processing_attempts`, but the next claim does. A retry of a document already at the cap is accepted into `queued` and then failed by the sweeper as `ATTEMPTS_EXHAUSTED`; there is no per-user reset of the budget.
 - **Access tokens are stateless.** `POST /auth/logout` cannot revoke a token on the server; the client discards it. There is no token blocklist and no refresh token. Workspace and role are re-read from the database on every request, so a revoked membership or a demotion takes effect immediately.
 - **The login rate limiter fails open by default.** If Redis is unreachable the limiter is bypassed and a warning is logged, because failing closed would turn a Redis outage into a total login outage. The credential check still applies. The posture is configurable (`LOGIN_RATE_LIMIT_FAILURE_MODE=closed` refuses logins with 503 while the limiter is unreachable) and is logged at startup.
 - **`X-Forwarded-For` is not trusted.** The per-IP login limit sees the proxy address behind a reverse proxy. Honouring the header is a deployment concern, because a client could otherwise spoof it to escape the limit.
@@ -820,7 +908,7 @@ Complete and verify one milestone before adding complexity. Document important a
 - **The shared storage mount is a local-development arrangement.** Compose bind-mounts `./backend/storage` into both the API and worker at `/srv/backend/storage`, so both processes see the same bytes. A multi-host production deployment needs an object store or a shared filesystem; the bind mount is not that solution.
 - **Deduplication is advisory, not a uniqueness guarantee.** The `(workspace_id, checksum)` index is non-unique, and the service performs a check-then-insert. Two concurrent identical uploads can both create documents. This is intentional so `allow_duplicate=true` and legitimate re-uploads remain possible; strict idempotency would need a separate idempotency key or conflict path.
 - **The file store and database are not atomic.** Uploads write the file before committing the row, and failures are compensated best-effort. A process crash between the file write and the commit can leave an unreferenced object; the current system has no orphan-file collector. Delete has the symmetric crash window: a file removed before a failed commit leaves a row with a missing file until a retry completes the delete.
-- **Only PDF uploads are accepted**, and only a plain `%PDF-` signature is checked. Page count, character count, and processing-time limits arrive with the worker.
+- **Only PDF uploads are accepted**, and the upload and integrity processor check only a plain `%PDF-` signature. Page count, character count, and extraction-time limits arrive with real PDF parsing in Phase 5; the worker already has 480 s soft / 600 s hard Celery limits.
 - **No `audit_logs` table yet.** Document deletion writes a structured log line; the permanent audit trail is Phase 10.
 - **The evaluation directory is scaffolding.** It provides a frozen corpus, a schema, and 20 seed questions, but no retrieval or generation quality has been measured.
 - **Local credentials and development settings are not suitable for production.** The application refuses to start with the placeholder `JWT_SECRET_KEY` when `ENV` is not `dev`.

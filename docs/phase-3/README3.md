@@ -25,7 +25,7 @@ That split creates four concrete failure modes:
 
 - **A row without a file.** If the row is committed first and the file write fails, the API advertises a document that the worker cannot read. Download fails, and the row is stuck in a state no component can repair.
 - **A file without a row.** If the file is written first and the database commit fails, an unreferenced object remains. It costs storage and cannot be found through the API.
-- **Duplicate work.** A client retry, a double-click, or an uncertain network response can upload the same bytes twice. Two rows and two files mean duplicate storage and, once Phase 4 exists, duplicate processing.
+- **Duplicate work.** A client retry, a double-click, or an uncertain network response can upload the same bytes twice. Two rows and two files mean duplicate storage and, now that Phase 4 publishes to the worker, duplicate processing.
 - **Identity confusion.** The filename is user-controlled, unstable, and not proof of content. If it were the identity, `report.pdf` would collide with a different `report.pdf`, while the same PDF under `report-final.pdf` would look new.
 
 Phase 3 makes the common path safe and the failure path explicit:
@@ -36,7 +36,7 @@ Phase 3 makes the common path safe and the failure path explicit:
 - intentional re-uploads remain possible;
 - a storage outage is reported as a retryable `503`, not as a validation error.
 
-Phase 3 does **not** process documents. It ends with a durable `queued` row and a file the worker can read.
+Phase 3 itself does **not** process documents. It ends with a durable `queued` row and a file the worker can read; Phase 4 adds the worker, claim, commit, and recovery lifecycle.
 
 ---
 
@@ -229,7 +229,7 @@ The duplicate response deliberately **does not modify the existing document**. I
 
 Within the same tier, the newest row wins. The ordering is implemented with a SQL `CASE` expression, not by filtering out unhealthy rows. A retry of the same bytes therefore returns the original row instead of creating a second one, even when the original failed.
 
-`uploaded` is not produced by Phase 3. It remains in the priority list because Phase 4 will introduce the save-succeeded / enqueue-failed recovery state.
+`uploaded` is not produced by Phase 3, and the Phase 4 implementation still does not produce it: Phase 4 kept the single-commit `queued` handoff and uses the sweeper's `queued` rule when a publish fails. The priority entry remains because `uploaded` is a supported recovery state in the sweeper and the enum, even though no current code path creates it (D-016).
 
 ### 7.2 Advisory, not a uniqueness guarantee
 
@@ -438,15 +438,17 @@ There is no way to make the two systems perfectly atomic with this design. The p
 
 ---
 
-## 12. What Phase 3 deliberately does not do
+## 12. What Phase 3 deliberately did not do
 
-- **No broker publish.** The row is committed as `queued`, but no Celery task is sent. Phase 4 owns the queue.
-- **No `uploaded` state or sweeper in the upload path.** The state remains part of the v0.1 model for Phase 4's save-succeeded / enqueue-failed recovery.
-- **No PDF parsing or chunking.** The bytes are stored verbatim.
+Phase 4 now owns the queue and recovery path described in §14. These bullets describe the Phase 3 boundary, not the current system.
+
+- **No broker publish in Phase 3.** The row is committed as `queued`, but no Celery task is sent. Phase 4 adds the post-commit publish and the worker.
+- **No `uploaded` state or sweeper in the upload path.** The state remains part of the v0.1 model, and Phase 4 implements its sweeper rule, but the current upload path still commits directly to `queued` (D-016).
+- **No PDF parsing or chunking in Phase 3.** The bytes are stored verbatim. Phase 4 adds an integrity-only processor; text extraction and chunking remain Phase 5 work.
 - **No object store.** `LocalFileStorage` is the only adapter. The port is the seam, not the implementation.
 - **No strict deduplication.** Concurrent identical uploads can both create documents; see §7.2.
 - **No orphan-file collector.** Exception paths compensate; a process crash between file write and row commit can leave an unreferenced object.
-- **No migration.** The existing checksum column and non-unique index carry the feature.
+- **No Phase 3 migration.** The existing checksum column and non-unique index carry the feature. Phase 4 adds revision `0002` for `retryable` and the sweeper index.
 
 ---
 
@@ -457,8 +459,11 @@ There is no way to make the two systems perfectly atomic with this design. The p
 | `tests/test_storage_port.py` | The five-operation protocol, error taxonomy, key layout, path rules |
 | `tests/test_storage.py` | Local and in-memory adapters: save/read, overwrite, empty objects, missing objects, idempotent delete, containment |
 | `tests/test_ingestion_service.py` | Validation, checksum dedup, status priority, forced upload, cross-workspace isolation, compensation |
-| `tests/test_documents.py` | HTTP routes: `202`/`200`, `duplicate` field, cross-workspace `404`, storage `503`, download, delete |
+| `tests/test_documents.py` | HTTP routes: `202`/`200`, `duplicate` field, cross-workspace `404`, storage `503`, download, delete, retry semantics, publish after commit |
 | `tests/test_openapi.py` | The `200` and `202` responses and the `allow_duplicate` parameter are visible to clients |
+| `tests/test_worker_pipeline.py` | Phase 4 claim, guarded commit, attempt cap, chunk replacement, failure classification |
+| `tests/test_sweeper.py` | Phase 4 stale-state recovery, publish failures, timestamp marker, advisory lock |
+| `tests/test_worker_recovery.py` | Phase 4 upload-with-failing-publisher → queued → sweep → claim recovery |
 
 The full suite is expected to run against real PostgreSQL and Redis. Route tests use an isolated temporary `LocalFileStorage` or the in-memory fake; they never write to `backend/storage`.
 
@@ -473,9 +478,9 @@ The last command is the authoritative full-suite run because the default Compose
 
 ---
 
-## 14. Phase 4 handoff
+## 14. Phase 4 handoff — completed
 
-Phase 3 ends with a document that is safe for Phase 4 to read:
+Phase 3 ended with a document that was safe for Phase 4 to read:
 
 - the row is committed as `queued`;
 - the bytes are durable at `uploads/{document_id}/original.pdf`;
@@ -483,11 +488,18 @@ Phase 3 ends with a document that is safe for Phase 4 to read:
 - a storage failure is distinguishable from a validation failure;
 - a duplicate upload is a normal `200` and does not enqueue duplicate work.
 
-Phase 4 can therefore add, without redesigning storage or the upload API:
+Phase 4 used that boundary without redesigning storage or the upload API. Status:
 
-1. the broker publish and the `uploaded → queued` recovery state;
-2. the database claim and `processing_runs`;
-3. PDF extraction and chunking;
-4. retries, failure classification, and the sweeper.
+| Handoff item | Status | Where |
+|---|---|---|
+| Broker publish after the upload commit | Done | `app/worker/publisher.py`, `app/api/routes/documents.py` |
+| `uploaded → queued` recovery state | Supported, not produced by the current upload path (D-016) | `app/worker/sweeper.py` |
+| Database claim and `processing_runs` | Done | `app/worker/pipeline.py` |
+| Guarded commit and chunk replacement | Done | `app/worker/pipeline.py` |
+| Failure classification, bounded retries, manual retry | Done | `app/processing/errors.py`, `app/worker/tasks.py` |
+| State-based sweeper and Beat schedule | Done | `app/worker/sweeper.py`, `app/worker/celery_app.py` |
+| PDF extraction and chunking | Deferred to Phase 5 | The Phase 4 processor is integrity-only and returns zero chunks |
 
-The storage seam is already in place. The next phase should use `get_storage()` and `document.storage_key`; it should never construct a filesystem path from a user-supplied filename.
+The full implementation and the Phase 5 backfill plan are in [`../phase-4/README4.md`](../phase-4/README4.md).
+
+The storage seam remains in place. Phase 5 should use `get_storage()` and `document.storage_key`; it should never construct a filesystem path from a user-supplied filename.

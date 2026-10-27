@@ -22,7 +22,7 @@ Acceptance:
 **As a** knowledge worker, **I want** to see processing status and retry failures **so that** I know when a document is searchable.
 
 Acceptance:
-- `GET /api/v1/documents` / `GET /api/v1/documents/{id}` expose `queued → processing → retrying → indexed / failed`. Phase 3 creates documents in `queued`; `uploaded` is reserved for the Phase 4 save-succeeded / enqueue-failed recovery path.
+- `GET /api/v1/documents` / `GET /api/v1/documents/{id}` expose `queued → processing → retrying → indexed / failed`. Phase 3 creates documents in `queued`; Phase 4 keeps that single-commit handoff, so `uploaded` remains a supported recovery state for a split writer but is not produced by the current upload path (D-016).
 - `failed` includes actionable `error_code` + `message`, no internal stack traces.
 - `POST /api/v1/documents/{id}/retry` works only from `failed` (retryable) and never duplicates chunks.
 - Maps to FR-03, FR-10.

@@ -1,6 +1,6 @@
 # Axiom — Architecture (Phase 1, Step 2)
 
-Modular monolith. One codebase (`backend/app/`), two runtimes: API process + Celery worker process. PostgreSQL (+pgvector) is the source of truth. Redis is transport only.
+Modular monolith. One codebase (`backend/app/`), two runtime roles: API process + Celery worker process, with a separate Beat scheduler for the sweeper. PostgreSQL (+pgvector) is the source of truth. Redis is transport only.
 
 ## Diagram
 
@@ -59,18 +59,18 @@ Violations fail review; enforced by import lints from Phase 2.
 ## Runtimes
 
 - API: `uvicorn backend.app.main:app`. Stateless, no in-memory jobs.
-- Worker: `celery -A backend.app.worker.celery_app worker`. Receives `document_id` only.
-- Infra (Compose): `postgres:pgvector`, `redis` (persisted, no eviction), `api`, `worker`.
+- Worker: `celery -A app.worker.celery_app worker` (from `backend/`). Receives `document_id` only.
+- Infra (Compose): `postgres:pgvector`, `redis` (persisted, no eviction), `api`, `worker`, `beat`.
 
 ## Request flows
 
 Upload (Phase 3, implemented): `UI → POST /documents → api validates + hashes → duplicate? → 200 existing : storage.save → db INSERT status=queued → commit → 202 {document_id}`. There is no broker publish in Phase 3.
 
-Upload (Phase 4 target): `… storage.save → db(doc=uploaded) → publish → db(doc=queued) → 202`, with the sweeper recovering a committed `uploaded` row whose publish failed.
+Upload (Phase 4, implemented): `… storage.save → db INSERT status=queued → commit → best-effort publish → 202`. A failed publish leaves the durable `queued` row for the sweeper; `uploaded` remains a supported recovery state for a split writer but is not produced by the current upload path (D-016).
 
-Worker: `claim (UPDATE...WHERE RETURNING) → storage.open → ingest → embed → db chunks+indexed in one txn`.
+Worker (Phase 4): `claim (UPDATE...WHERE RETURNING) → storage.read → integrity verify → db chunk set + indexed in one txn`. The Phase 4 processor returns zero chunks; Phase 5 replaces it with extraction and embedding.
 Chat: `POST /chat → auth scope → retrieval (workspace_id filter) → ai_workflow generate+validate citations → trace row → answer`.
 
 ## Failure pointers
 
-File/model/DB/queue/auth failure taxonomy, retry bounds, and sweeper thresholds live in `04-job-reliability-contract.md` (Phase 1, Step 5). This diagram adds no new behavior.
+File/model/DB/queue/auth failure taxonomy, retry bounds, and sweeper thresholds live in `05-job-contract.md` (Phase 1, Step 5). This diagram adds no new behavior.

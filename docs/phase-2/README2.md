@@ -485,12 +485,12 @@ docker compose run --rm api alembic upgrade head
 docker compose run --rm api python -m app.auth.bootstrap --email admin@example.com --workspace "My Workspace"
 
 # 6. Run
-docker compose up --build api worker
+docker compose up --build api worker beat
 ```
 
 **Where things are:** API on `http://localhost:8000`, interactive docs on `http://localhost:8000/docs`, files under `backend/storage/`.
 
-**Where the API runs matters.** The API and the worker are meant to run *inside* the Compose network, where PostgreSQL is `postgres:5432` and Redis is `redis:6379`. Those names do not resolve on the Windows host, and the default stack does not publish those ports, so a uvicorn process started on the host would find neither database nor Redis.
+**Where the API runs matters.** The API, worker, and Beat are meant to run *inside* the Compose network, where PostgreSQL is `postgres:5432` and Redis is `redis:6379`. Those names do not resolve on the Windows host, and the default stack does not publish those ports, so a uvicorn process started on the host would find neither database nor Redis.
 
 **One API process. Never two.** This is the trap that costs the most time on Windows. `asyncio` sets `SO_REUSEADDR` on its listening socket, and on Windows that flag lets a second process bind a port that is already in use. So a host uvicorn can "successfully start on port 8000" while the container is publishing the same port — no "address already in use", no warning. From then on, requests are split between two servers with **different configuration**: the container talks to `postgres:5432` and works, the host process talks to `localhost:5432` and times out. The symptom is maddening because it looks random.
 
@@ -652,18 +652,18 @@ Read in this order. Each step builds on the previous.
 
 ---
 
-## 13. What is deliberately *not* here yet
+## 13. What was deliberately *not* here at the end of Phase 2
 
-Being honest about the boundary of this phase:
+Being honest about the boundary of this phase (later phases are noted where they change it):
 
-- **No background processing.** The worker container now starts, connects to the broker and waits for work — but there are no task modules yet, so nothing is ever consumed. Documents sit in `queued` until Phase 4.
+- **No background processing at the end of Phase 2.** The worker container started and connected to the broker, but there were no task modules, so nothing was consumed. Phase 4 adds `documents.process` and the sweeper; see [`../phase-4/README4.md`](../phase-4/README4.md).
 - **No answers.** There is no retrieval, no embedding, no LLM call. The `chunks` and `citations` tables exist and are correct, but nothing writes to them yet.
 - **No conversations.** The tables exist; the `/chat` endpoints arrive in Phase 5.
 - **Tokens cannot be revoked.** `POST /auth/logout` cannot invalidate a token — the server keeps no list. The client discards it. A token also stops working when it expires, and any change to the account takes effect immediately.
 - **No refresh tokens.** Access tokens last 30 minutes and then you log in again.
 - **No `audit_logs` table.** Document deletion writes a structured log line; the permanent audit trail is Phase 10.
 - **Files are on local disk.** The `FileStorage` port and `LocalFileStorage` now exist (Phase 3), but an object-store adapter is still future work.
-- **Only PDF, and only a signature check.** `%PDF-` at the start. Page counts, character limits and timeouts arrive with the worker.
+- **Only PDF, and only a signature check.** `%PDF-` at the start. Phase 4 adds worker time limits; page counts, character limits, and extraction limits remain Phase 5 work.
 
 ---
 
@@ -867,7 +867,7 @@ docker compose run --rm api sh -c "pip install --no-cache-dir -r requirements-de
 ## 15. Where to go next
 
 - **Phase 3 — Document Ingestion (completed).** The `FileStorage` port and local adapter, workspace-scoped SHA-256 deduplication, the upload lifecycle, and shared API/worker storage. See `docs/phase-3/README3.md`.
-- **Phase 4 — Background Processing (next).** The Celery worker, the database claim, the sweeper, and retries. This is where `queued` documents start becoming `indexed`.
+- **Phase 4 — Background Processing (completed).** The Celery worker and Beat, the database claim, the guarded commit, classified retries, the sweeper, and recovery drills. This is where `queued` documents start becoming `indexed`; see [`../phase-4/README4.md`](../phase-4/README4.md).
 - **Phase 5 — PDF RAG MVP.** Parsing, chunking, embeddings, retrieval, cited answers and honest abstention.
 
 The design documents that back all of this live in `docs/phase-1/`:

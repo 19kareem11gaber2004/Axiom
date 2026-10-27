@@ -33,7 +33,7 @@ All user-data tables carry `workspace_id` from creation. Server resolves it from
 
 **workspace_memberships** — `user_id FK→users ON DELETE CASCADE, workspace_id FK→workspaces ON DELETE CASCADE, role ENUM(owner,admin,member,viewer), created_at`; PK `(user_id, workspace_id)` `[v0.1]`.
 
-**documents** — `id, workspace_id FK→workspaces ON DELETE RESTRICT, uploaded_by (snapshot UUID, NO FK — see §4), original_filename, storage_key UNIQUE, mime_type, size_bytes, checksum, status ENUM(uploaded,queued,processing,retrying,indexed,failed), processing_attempts INT DEFAULT 0, error_code NULL, error_message NULL, created_at, updated_at, indexed_at NULL`; `UNIQUE(id, workspace_id)` (composite-FK target); `INDEX(workspace_id, status, created_at)`; `INDEX(workspace_id, checksum)` (dup warn, not unique — see §7) `[v0.1]`.
+**documents** — `id, workspace_id FK→workspaces ON DELETE RESTRICT, uploaded_by (snapshot UUID, NO FK — see §4), original_filename, storage_key UNIQUE, mime_type, size_bytes, checksum, status ENUM(uploaded,queued,processing,retrying,indexed,failed), processing_attempts INT DEFAULT 0, error_code NULL, error_message NULL, retryable BOOLEAN NOT NULL DEFAULT false, created_at, updated_at, indexed_at NULL`; `UNIQUE(id, workspace_id)` (composite-FK target); `INDEX(workspace_id, status, created_at)`; `INDEX(workspace_id, checksum)` (dup warn, not unique — see §7); `INDEX(status, updated_at)` (sweeper scan — revision `0002`) `[v0.1]`.
 
 **processing_runs** — `id, document_id NOT NULL, workspace_id NOT NULL, attempt_no INT NOT NULL, stage TEXT NOT NULL, started_at, finished_at NULL, error_code/message NULL`; FK `(document_id, workspace_id) → documents(id, workspace_id) ON DELETE CASCADE` `[v0.1]`; `UNIQUE(document_id, attempt_no)` `[v0.1]`.
 
@@ -45,7 +45,7 @@ All user-data tables carry `workspace_id` from creation. Server resolves it from
 
 **citations** — `id, message_id NOT NULL, workspace_id NOT NULL, document_id NOT NULL (snapshot, NO FK — see §3), chunk_id NULL FK→chunks(id) ON DELETE SET NULL, original_filename TEXT NOT NULL (snapshot), page_number NULL, passage_text TEXT NOT NULL (snapshot), score NULL, created_at`; FK `(message_id, workspace_id) → messages(id, workspace_id) ON DELETE CASCADE` `[v0.1]`; `INDEX(message_id)` `[v0.1]`.
 
-Reference implementation: `backend/app/db/models.py:1` — **aligned with this section** (Step 9.4): it contains `original_filename` on citations, the `processing_runs` unique constraint, the chunk CHECKs/indexes, and the `ON DELETE` actions above. Migration `backend/alembic/versions/0001_v01_init.py` matches it and has been executed against a real PostgreSQL 18.6 + pgvector 0.8.1 instance.
+Reference implementation: `backend/app/db/models.py:1` — **aligned with this section** (Step 9.4): it contains `original_filename` on citations, the `processing_runs` unique constraint, the chunk CHECKs/indexes, and the `ON DELETE` actions above. Migration `backend/alembic/versions/0001_v01_init.py` matches the original schema and has been executed against a real PostgreSQL 18.6 + pgvector 0.8.1 instance. Revision `0002_phase4_background_processing.py` adds `documents.retryable` and the `(status, updated_at)` sweeper index.
 
 ENUM note: `document_status`, `membership_role` and `message_role` are native PostgreSQL ENUM types. Revision 0001 creates each one **exactly once** (see `create_type=False` in the migration) — SQLAlchemy's default automatic `CREATE TYPE` emission would otherwise produce a duplicate that PostgreSQL rejects. `backend/tests/test_migration_sql.py` guards this.
 
@@ -92,29 +92,37 @@ Least privilege. `owner` = `admin` for all v0.1 document/chat operations; the on
 
 Notes: conversations are private to their creator except admin/owner reads `[v0.1]`; shared workspace conversations are `[later]`. Cross-workspace IDs → `403/404` without leaking existence (use `404` for reads, `403` for writes the membership forbids — fixed per endpoint in §8, applied consistently).
 
-## 6. Worker reliability and state transitions [v0.1]
+## 6. Worker reliability and state transitions [v0.1, implemented in Phase 4]
 
-Allowed transitions (actor in brackets):
+Allowed transitions (actor in brackets). `processing_attempts` increments **only** on a worker claim:
 
 ```text
-uploaded --[api upload / sweeper]--> queued --[worker claim]--> processing
-processing --[worker: transient fail]--> retrying --[worker claim]--> processing
+POST /documents commits queued (processing_attempts=0), then publishes best effort
+queued --[worker claim]--> processing
+processing --[worker: transient fail, claims remain]--> retrying
+retrying --[fresh task then worker claim]--> processing
 processing / retrying --[worker guarded commit]--> indexed
 processing / retrying --[worker: permanent or attempts exhausted]--> failed
-failed --[member+ POST retry, retryable only]--> queued (processing_attempts + 1)
+queued / retrying --[sweeper: attempts at cap]--> failed
+processing --[sweeper: stale, claims remain]--> retrying
+processing --[sweeper: stale, attempts at cap]--> failed
+uploaded --[sweeper]--> queued
+failed --[member+ POST retry, retryable only]--> queued (no attempt increment)
 uploaded / queued / indexed / failed --[admin+ DELETE]--> (row removed)
 processing / retrying --[DELETE]--> 409 CONFLICT (delete blocked while worker owns the doc)
 ```
 
 Rules:
 
-1. Claim: worker starts only via conditional `UPDATE documents SET status='processing', processing_attempts=attempts+1, updated_at=now() WHERE id=:id AND workspace_id=:ws AND status IN ('queued','retrying') RETURNING *`. Zero rows → exit quietly (another worker/sweeper won) `[v0.1]`.
-2. Guarded commit: chunks + status change in ONE transaction: `DELETE chunks WHERE doc` → `INSERT` new set (conflicts on `(document_id, chunk_index)` abort) → `UPDATE documents SET status='indexed' WHERE id AND status IN ('processing','retrying') AND processing_attempts=:claimed` → insert finished `processing_runs` row. Zero-row update → ROLLBACK (stale worker or concurrent delete wins; temp files cleaned, nothing re-inserted) `[v0.1]`.
+1. Claim: the task payload carries only `document_id` (D-017). The worker reads the row's `workspace_id`, then performs one conditional `UPDATE documents SET status='processing', processing_attempts=processing_attempts+1, updated_at=now(), error_code=NULL, error_message=NULL, retryable=false WHERE id=:id AND workspace_id=:ws AND status IN ('queued','retrying') AND processing_attempts < :max_attempts RETURNING ...`, and inserts a `processing_runs` row with `stage='claimed'` and the returned attempt number in the same transaction. Zero rows → rollback and exit quietly (another worker/sweeper won, or the cap is exhausted) `[v0.1]`.
+2. Guarded commit: chunks + status change in ONE transaction: `DELETE chunks WHERE document_id AND workspace_id` → flush the `INSERT` of the new set (a duplicate `(document_id, chunk_index)` raises `CHUNK_CONFLICT` and rolls everything back) → `UPDATE documents SET status='indexed', indexed_at=now(), error_code=NULL, retryable=false WHERE id AND workspace_id AND status IN ('processing','retrying') AND processing_attempts=:claimed RETURNING id` → close the run row (`stage='indexed'`, `finished_at=now()`). A zero-row document update → ROLLBACK (stale worker or concurrent delete wins; the previous chunk set remains visible and nothing is re-inserted) `[v0.1]`.
 3. Delete vs worker race: delete is `409` during `processing/retrying`, so the race window is claim-commit. If the row is gone at commit time, the FK + zero-row guard abort the transaction; the worker must not recreate the parent row `[v0.1]`.
-4. Re-index/duplicate delivery: same task twice → one claim wins (§6.1); the loser exits. Retry re-runs the full txn in rule 2 (delete-then-insert), so no duplicate or mixed-version chunks. Embedding/model/dim of existing chunks is checked before reuse: mismatch aborts unless a full re-index flag is set (Phase 5 owns the flag; schema records the versions) `[v0.1]`.
-5. Save-succeeded/enqueue-failed: v0.1 minimum safe behavior is row-first (`uploaded` committed), best-effort enqueue, plus the Phase 4 sweeper periodically moving stuck `uploaded`/`queued` and timed-out `processing` rows back to `queued`/`retrying`/`failed` under an attempt cap `[v0.1]`. A transactional outbox is `[later]`; extension point: add `outbox_events` insert to the upload transaction and a dispatcher, with no FK changes required.
-6. Crash mid-task: no in-memory state is authoritative; sweeper + attempt cap is the only recovery path. Visibility timeout must exceed max task runtime (Phase 4 contract) `[v0.1]`.
-7. Retry endpoint: only from `failed` with `retryable=true`; re-queues with `processing_attempts+1`, clears `error_code/message`, inserts a new `processing_runs` row. Double-clicking retry is idempotent (second call sees `queued`, returns `409`, no new attempt) `[v0.1]`.
+4. Re-index/duplicate delivery: same task twice → one claim wins (§6.1); the loser exits with `noop`. A retry re-runs the full transaction in rule 2 (delete-then-insert), so no duplicate or mixed-version chunks. The processor is responsible for embedding/model/dimension consistency; a conflict aborts the commit and leaves the previous set intact `[v0.1]`.
+5. Save-succeeded/enqueue-failed: the implemented upload path keeps Phase 3's single-commit handoff: bytes are durable, the row is committed directly as `queued`, and the broker publish happens after the commit as a best effort. A failed publish leaves a `queued` row that the sweeper republishes after `SWEEPER_QUEUED_STALE_SECONDS`; the API still returns `202`. The `uploaded` state and its sweeper rule remain supported for a split writer, but no current code path creates `uploaded` (D-016). A transactional outbox is `[later]`; extension point: add an `outbox_events` insert to the upload transaction and a dispatcher, with no FK changes required.
+6. Crash mid-task: no in-memory state is authoritative; the sweeper + attempt cap is the only recovery path. A `processing` row older than `SWEEPER_PROCESSING_STALE_SECONDS` (900 s by default, greater than the 600 s hard task limit) moves to `retrying` with `PROCESSING_TIMEOUT` and `retryable=true`, or to `failed` with `ATTEMPTS_EXHAUSTED` at the cap. The open run row is closed with `stage='timeout'`. Broker visibility timeout (1800 s) must exceed max task runtime `[v0.1]`.
+7. Retry endpoint: only from `failed` with `retryable=true`. One conditional `UPDATE ... SET status='queued', error_code=NULL, error_message=NULL, retryable=false` clears the error and returns the row. It does **not** increment `processing_attempts` and does **not** insert a run row; the next worker claim does both. Double-clicking retry is idempotent (the second call sees `queued`, matches zero rows, returns `409`, and starts no new attempt). A manual retry at the cap is accepted into `queued` but cannot be claimed; the sweeper fails it as `ATTEMPTS_EXHAUSTED` `[v0.1]`.
+8. Failure classification: transient (`STORAGE_UNAVAILABLE`, `STORAGE_IO_ERROR`, `PROCESSING_TIMEOUT`) retries automatically while claims remain. Permanent-fixable (`FILE_MISSING`, `STORAGE_PERMISSION_DENIED`) sets `failed` with `retryable=true`. Permanent-final (`CHUNK_CONFLICT`, `STORAGE_PATH_INVALID`, `CHECKSUM_MISMATCH`, `INVALID_PDF`, `EMPTY_FILE`, `INTERNAL_ERROR`) sets `failed` with `retryable=false`. Automatic retries use `min(base * 2^(attempt-1) + jitter, maximum)` and publish a fresh task after the `retrying` transition commits; `self.retry()` is not used (D-020) `[v0.1]`.
+9. Run-row lifecycle: one row per claim, unique `(document_id, attempt_no)`. Claim opens it as `claimed`; commit/failure closes it as `indexed`/`retrying`/`failed`; the sweeper closes a timed-out run as `timeout`. A retrying run row is closed, and the next attempt gets a new row. A manual retry creates no row until a claim starts `[v0.1]`.
 
 ## 7. Constraints, indexes, and pagination [v0.1]
 
@@ -124,6 +132,7 @@ Add only what v0.1 access patterns justify (no ANN index):
 - `UNIQUE(chunks.document_id, chunk_index)` + `CHECK(chunk_index >= 0)` — idempotent chunk sets (DB) `[v0.1]`.
 - `CHECK(chunks.embedding_dim > 0)` (DB); exact model↔dim match validated app-side at index and query time, with a Phase 5 consistency test (no silent model mix) `[v0.1]`.
 - `INDEX(documents.workspace_id, status, created_at)` — status-filtered lists; `ORDER BY created_at, id` with `limit default 20 max 100` for stable pagination `[v0.1]`.
+- `INDEX(documents.status, updated_at)` — global stale-document scan for the sweeper; the workspace-scoped index cannot serve a query that intentionally spans workspaces `[v0.1]`.
 - `INDEX(documents.workspace_id, checksum)` — duplicate-upload warning lookup (non-unique: warn and return existing, but allow intentional re-upload) `[v0.1]`. Trade-off: a UNIQUE constraint would enforce dedup strictly but block legitimate re-uploads of identical content under a new name; warning was chosen.
 - `INDEX(chunks.workspace_id)` — workspace-filtered exact vector scan `[v0.1]`.
 - `INDEX(conversations.workspace_id, created_at)`, `INDEX(messages.conversation_id, created_at)`, `INDEX(citations.message_id)` — history reads `[v0.1]`.
@@ -151,9 +160,9 @@ Provisioning: Axiom has **no public registration**. The only path that creates a
 
 **Login rate limiting (step 2.7).** Redis counts *failures*, not attempts, so a user who mistypes once is not punished; a successful login clears the counter. Two limits apply: per account (5 failures / 60 s) and per source IP (30 failures / 60 s, higher because many users share one address). The window is fixed — the TTL starts at the first failure. If Redis is unreachable the limiter **fails open** and logs a warning: failing closed would turn a Redis outage into a total login outage, and the credential check still applies either way. `X-Forwarded-For` is deliberately not trusted, because a client could otherwise spoof it to escape the per-IP limit.
 
-### 8.2 Documents (Phase 2 API + Phase 3 ingestion, implemented)
+### 8.2 Documents (Phase 2 API + Phase 3 ingestion + Phase 4 processing, implemented)
 
-Uploads are accepted as PDF only. The file is written through the `FileStorage` port to `<storage_root>/uploads/{document_id}/original.pdf`; the row is created in the same request; the `202` is returned only after **both** the bytes and the row are durable. The path is built from the server-generated document id, never from the user's filename. Phase 3 implements the upload contract below. No Alembic migration is required: the existing `documents.checksum` column and non-unique `(workspace_id, checksum)` index carry deduplication.
+Uploads are accepted as PDF only. The file is written through the `FileStorage` port to `<storage_root>/uploads/{document_id}/original.pdf`; the row is committed as `queued` in the same request; the `202` is returned only after **both** the bytes and the row are durable. The path is built from the server-generated document id, never from the user's filename. Phase 3 implements the upload contract below; Phase 4 adds the post-commit broker publish and the worker lifecycle. No Phase 3 migration was required: the existing `documents.checksum` column and non-unique `(workspace_id, checksum)` index carry deduplication. Phase 4 adds `documents.retryable` and the `(status, updated_at)` sweeper index in revision `0002`.
 
 | Method | Endpoint | Role | Success | Errors | Scoping / state |
 |---|---|---|---|---|---|
@@ -161,7 +170,7 @@ Uploads are accepted as PDF only. The file is written through the `FileStorage` 
 | `GET` | `/documents?status_filter=&q=&limit=&offset=` | viewer+ | `200 {items, total}` ordered `(created_at,id)` | `401`, `403` | workspace-filtered in SQL; `q` matches filename only; limit 20 default / 100 max |
 | `GET` | `/documents/{id}` | viewer+ | `200` metadata+status+error | `401`, `404` (incl. other-workspace ids) | membership-checked |
 | `GET` | `/documents/{id}/file` | viewer+ | `200` file stream | `401`, `404`, `409 INVALID_STATE` (status `uploaded` or stored object missing), `503 DEPENDENCY_UNAVAILABLE` | the only authorized path to the bytes; no local path is exposed |
-| `POST` | `/documents/{id}/retry` | member+ | `200 {document_id, status:'queued'}` | `401`, `404`, `409 INVALID_STATE` (not `failed`), `403` | clears the error, `attempts+1`; permanent-vs-transient split arrives with Phase 4 |
+| `POST` | `/documents/{id}/retry` | member+ | `200 {document_id, status:'queued'}` | `401`, `404`, `409 INVALID_STATE` (not `failed`, or `retryable=false`), `403` | conditional `failed + retryable → queued`; clears the error and `retryable`; does **not** increment `processing_attempts`; the next claim consumes the attempt |
 | `DELETE` | `/documents/{id}` | admin+ | `204` | `401`, `404`, `409 INVALID_STATE` (in `processing/retrying`), `403`, `503 DEPENDENCY_UNAVAILABLE` (storage delete failed; the row deletion rolls back) | file + row removed; chunks/runs cascade; citations keep their snapshots |
 
 Ordering rule for single-document routes: the **resource is resolved before the role is checked**, so a document in another workspace always answers `404` no matter which role the caller holds. A `403` would confirm that the id exists.
@@ -189,7 +198,16 @@ Rules:
 - A validation failure remains `400 VALIDATION_ERROR`; a storage I/O failure is `503 DEPENDENCY_UNAVAILABLE`; a missing stored object on download is `409 INVALID_STATE`.
 - Delete flushes the row deletion, removes the storage object, then commits. A storage outage rolls the row deletion back and returns `503`; a missing object is idempotent and the row is still deleted.
 - The upload endpoint reads at most `max_upload_bytes + 1` bytes, so an absent or incorrect `UploadFile.size` cannot force an unbounded read.
-- The actual broker publish, the durable `uploaded` state, and the sweeper remain Phase 4. Phase 3 commits directly to `queued` after the bytes and row are durable.
+- Phase 4 publishes a new document after the row commit as a best effort. A publish failure leaves the durable `queued` row for the sweeper; the upload still answers `202`. A duplicate upload is not published. The `uploaded` state and its sweeper rule remain supported for a split writer but are not produced by the current upload path (D-016).
+
+#### Phase 4 processing contract (implemented)
+
+- **Task payload.** `documents.process` and `documents.sweep` are the two registered tasks. The process task carries only `document_id`; the worker resolves `workspace_id` from the row and repeats it in the claim.
+- **Attempts.** `processing_attempts` counts claims. The claim requires `processing_attempts < MAX_PROCESSING_ATTEMPTS` (5 by default). The manual retry endpoint does not increment it; the next claim does.
+- **Runs.** The claim inserts a `processing_runs` row with `stage='claimed'` and the claimed attempt number. The guarded commit, failure path, and sweeper timeout close it with `indexed`, `retrying`, `failed`, or `timeout`. A manual retry creates no run row.
+- **Status and errors.** `documents.retryable` records whether the retry endpoint may re-queue a failed document. Transient failures are retryable while claims remain; permanent-fixable failures are retryable after a repair; permanent-final failures and `ATTEMPTS_EXHAUSTED` are not.
+- **Recovery.** The sweeper handles stale `uploaded`, `queued`, `retrying`, and `processing` rows under a PostgreSQL advisory lock. It commits state before publishing and touches `updated_at` only after a successful publish.
+- **Current processor.** The Phase 4 processor verifies the stored bytes and returns zero chunks, so an `indexed` document may have no chunk rows until the Phase 5 backfill.
 
 ### 8.3 Browser access (CORS, step 2.6, implemented)
 
@@ -218,7 +236,7 @@ Middleware order is `request_id → CORS → error boundary → router`. The err
 5. Deletion race: delete during `processing` → `409`; worker commit after delete → aborts, no resurrected rows/chunks.
 6. Duplicate delivery: same task twice concurrently → exactly one claim, one chunk set (unique constraint holds).
 7. Retry idempotency: double retry click → single re-queue; retry from non-`failed` → `409`.
-8. Save-then-enqueue-fail: committed `uploaded` row recovered by sweeper in test (no outbox in v0.1).
+8. Save-then-enqueue-fail: an upload with a failing publisher still commits `queued`, returns `202`, and is recovered by the sweeper; the separately supported `uploaded` rule is covered by its own sweeper test (no outbox in v0.1).
 9. Crash recovery: killed worker's `processing` row reaped to `retrying`/`failed` under attempt cap.
 10. Embedding consistency: query with wrong model/dim rejected; mixed-version chunks never co-exist for one doc.
 11. Citation validity: every cited chunk was in the retrieved set; injection PDF asserts instructions are quoted, not executed; unanswerable set measures abstention.
